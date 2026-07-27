@@ -187,9 +187,17 @@ def vcp_scan(px: pd.DataFrame):
         if not dedup or abs(dedup[-1] - d) > 0.5:
             dedup.append(d)
     depths = dedup[-4:]
-    contracting = len(depths) >= 2 and all(
-        depths[i] >= depths[i + 1] - 1e-6 for i in range(len(depths) - 1))
-    vol_dry = vv.iloc[-10:].mean() < vv.iloc[-60:-10].mean()
+    # Relaxed contraction: the base is TIGHTENING if the most recent pullback is
+    # meaningfully shallower than the deepest earlier one. Real TW bases rarely
+    # contract 4x in a row, so we compare last vs. max-of-earlier instead of
+    # demanding strict monotonic decrease.
+    contracting = False
+    if len(depths) >= 2:
+        last = depths[-1]
+        earlier_max = max(depths[:-1])
+        contracting = last <= earlier_max * 0.60 and last <= 12   # last leg tight (<=12%) & <=60% of prior max
+    # Volume dry-up: recent 10d avg below the base's 50d avg (softened threshold)
+    vol_dry = vv.iloc[-10:].mean() <= vv.iloc[-60:-10].mean() * 1.05
     pivot = float(hh.iloc[-20:].max())
     price = float(cc.iloc[-1])
     out.update(vcp=bool(contracting and vol_dry),
