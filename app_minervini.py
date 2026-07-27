@@ -161,47 +161,41 @@ def trend_template(px: pd.DataFrame, rs_ok):
     return hits == 8, hits
 
 def vcp_scan(px: pd.DataFrame):
+    """Volatility Contraction Pattern via AMPLITUDE contraction (robust — no
+    swing-point counting). Split the base into 3 equal segments and measure each
+    segment's normalized daily volatility (mean of (high-low)/close). A base is
+    contracting when volatility steps down segment to segment and the latest
+    segment is tight. Pairs with volume dry-up. Pivot = 20d high."""
     out = dict(vcp=False, contr="", pivot=None, near=False)
-    c = px["close"]; h = px["max"]; v = px["Trading_Volume"]
-    if len(c) < 120:
+    if len(px) < 120:
         return out
-    win = px.iloc[-120:]
-    cc, hh, vv = win["close"], win["max"], win["Trading_Volume"]
-    arr_h = hh.values; arr_l = win["min"].values
-    piv_hi, piv_lo = [], []
-    for i in range(2, len(win) - 2):
-        if arr_h[i] == max(arr_h[i-2:i+3]): piv_hi.append((i, arr_h[i]))
-        if arr_l[i] == min(arr_l[i-2:i+3]): piv_lo.append((i, arr_l[i]))
-    if len(piv_hi) < 2 or len(piv_lo) < 2:
-        return out
-    depths = []
-    for hi_idx, hi_val in piv_hi:
-        lows_after = [(li, lv) for li, lv in piv_lo if li > hi_idx]
-        if lows_after:
-            _, next_low = min(lows_after, key=lambda t: t[0])
-            d = (hi_val - next_low) / hi_val * 100
-            if d > 0.5:
-                depths.append(d)
-    dedup = []
-    for d in depths:
-        if not dedup or abs(dedup[-1] - d) > 0.5:
-            dedup.append(d)
-    depths = dedup[-4:]
-    # Relaxed contraction: the base is TIGHTENING if the most recent pullback is
-    # meaningfully shallower than the deepest earlier one. Real TW bases rarely
-    # contract 4x in a row, so we compare last vs. max-of-earlier instead of
-    # demanding strict monotonic decrease.
-    contracting = False
-    if len(depths) >= 2:
-        last = depths[-1]
-        earlier_max = max(depths[:-1])
-        contracting = last <= earlier_max * 0.60 and last <= 12   # last leg tight (<=12%) & <=60% of prior max
-    # Volume dry-up: recent 10d avg below the base's 50d avg (softened threshold)
-    vol_dry = vv.iloc[-10:].mean() <= vv.iloc[-60:-10].mean() * 1.05
-    pivot = float(hh.iloc[-20:].max())
-    price = float(cc.iloc[-1])
+    base = px.iloc[-60:]                     # ~12 weeks base
+    hi = base["max"].values
+    lo = base["min"].values
+    cl = base["close"].values
+    vol = base["Trading_Volume"].values
+    amp = (hi - lo) / cl * 100               # daily amplitude % of close
+
+    seg = len(amp) // 3
+    s1 = amp[:seg].mean()                    # earliest third
+    s2 = amp[seg:2*seg].mean()               # middle third
+    s3 = amp[2*seg:].mean()                  # most recent third
+
+    # Contraction: volatility stepping down. Require the recent third clearly
+    # below the earliest third, and not expanding vs the middle third. Absolute
+    # tightness guard on the latest segment.
+    contracting = (
+        s3 <= s1 * 0.75                      # recent vol clearly below early vol
+        and s3 <= s2 * 1.05                  # not expanding into the latest leg
+        and s3 <= 6.0                        # latest segment tight in absolute terms
+    )
+    # Volume dry-up: recent 10d avg at/below the base's earlier avg (softened)
+    vol_dry = vol[-10:].mean() <= vol[:-10].mean() * 1.05
+
+    pivot = float(base["max"].iloc[-20:].max())
+    price = float(cl[-1])
     out.update(vcp=bool(contracting and vol_dry),
-               contr="→".join(f"{d:.0f}%" for d in depths) if depths else "",
+               contr=f"{s1:.0f}%→{s2:.0f}%→{s3:.0f}%",     # amplitude trend, not pullback depths
                pivot=round(pivot, 2), near=bool(price >= pivot * 0.97))
     return out
 
