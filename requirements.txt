@@ -1,5 +1,7 @@
 streamlit>=1.30
-FinMind
-pandas
-numpy
+FinMind==2.0.6
+lxml>=5.2
+pandas<3
+numpy<3
+
 
