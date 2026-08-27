@@ -1,0 +1,41 @@
+name: Backfill
+
+# 手動觸發用。跑完一次就不用再跑，除非要重建資料。
+on:
+  workflow_dispatch:
+    inputs:
+      years:
+        description: '回補幾年'
+        default: '2'
+      limit:
+        description: '只跑前 N 檔（0 = 全部，測試時填 30）'
+        default: '0'
+
+permissions:
+  contents: write
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install pandas requests pyarrow
+
+      - name: Run backfill
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+        run: python scripts/backfill.py --years ${{ inputs.years }} --limit ${{ inputs.limit }}
+
+      - name: Commit
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git diff --staged --quiet || git commit -m "backfill $(date +%Y-%m-%d)"
+          git push
