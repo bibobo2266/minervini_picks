@@ -1,8 +1,8 @@
 """
 一次性回補：用 FinMind 逐檔抓 2 年日線，建立 data/prices.parquet
 
-免費版限制 600 req/hr，所以每檔間隔 6.5 秒。約 1000 檔 → 110 分鐘。
-可中斷續跑：已經在 parquet 裡的代號會自動跳過。
+免費版限制 600 req/hr，所以每檔間隔 6.5 秒。約 2150 檔 → 約 4 小時。
+可中斷續跑：已經在 parquet 裡的代號會自動跳過，失敗再按一次 Run workflow 即可。
 
 用法：
     FINMIND_TOKEN=xxx python scripts/backfill.py
@@ -18,7 +18,9 @@ import pandas as pd
 import requests
 
 API = "https://api.finmindtrade.com/api/v4/data"
-OUT = "data/prices.parquet"
+DATA_DIR = "data"
+OUT = os.path.join(DATA_DIR, "prices.parquet")
+UNI = os.path.join(DATA_DIR, "universe.parquet")
 SLEEP = 6.5          # 600/hr 的安全間隔
 CHECKPOINT = 50      # 每 N 檔存一次檔
 COLS = ["date", "stock_id", "open", "max", "min", "close",
@@ -81,7 +83,6 @@ def save(frames, existing):
         else pd.concat(frames, ignore_index=True)
     df = df.drop_duplicates(subset=["stock_id", "date"], keep="last")
     df = df.sort_values(["stock_id", "date"]).reset_index(drop=True)
-    os.makedirs(os.path.dirname(OUT), exist_ok=True)
     df.to_parquet(OUT, index=False, compression="zstd")
     return df
 
@@ -92,11 +93,14 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="只跑前 N 檔（測試用）")
     args = ap.parse_args()
 
+    # 一切寫檔之前先確保目錄存在
+    os.makedirs(DATA_DIR, exist_ok=True)
+
     start = (dt.date.today() - dt.timedelta(days=365 * args.years + 30)).isoformat()
 
     uni = universe()
     print(f"母體 {len(uni)} 檔")
-    uni.to_parquet("data/universe.parquet", index=False)
+    uni.to_parquet(UNI, index=False)
 
     existing = pd.read_parquet(OUT) if os.path.exists(OUT) else pd.DataFrame(columns=COLS)
     done = set(existing["stock_id"]) if len(existing) else set()
@@ -132,8 +136,11 @@ def main():
             time.sleep(SLEEP)
 
     existing = save(buf, existing)
-    print(f"\n完成：{existing['stock_id'].nunique()} 檔 / {len(existing):,} 列")
-    print(f"檔案大小 {os.path.getsize(OUT) / 1e6:.1f} MB")
+    if len(existing):
+        print(f"\n完成：{existing['stock_id'].nunique()} 檔 / {len(existing):,} 列")
+        print(f"檔案大小 {os.path.getsize(OUT) / 1e6:.1f} MB")
+    else:
+        print("\n沒有抓到任何資料")
 
 
 if __name__ == "__main__":
