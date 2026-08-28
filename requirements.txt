@@ -1,6 +1,8 @@
 streamlit>=1.30
-FinMind==2.0.6
 pandas<3
 numpy<3
+requests
+pyarrow
+
 
 
