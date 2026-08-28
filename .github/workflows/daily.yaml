@@ -3,7 +3,7 @@ name: Daily update
 on:
   schedule:
     # 07:30 UTC = 台北 15:30（收盤後兩小時，資料已上架）
-    - cron: '30 7 * * 1-5'
+    -     - cron: '0 9 * * 1-5'     # 09:00 UTC = 台北 17:00（收盤後三個半小時，資料確定上架）
   workflow_dispatch:      # 也可以手動按
 
 permissions:
