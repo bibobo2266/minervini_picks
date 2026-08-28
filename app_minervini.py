@@ -480,16 +480,24 @@ with tab1:
                          .rename("檔數").reset_index(), hide_index=True)
 
         hot = df[df["狀態"].isin(["觸發", "準備"])]["代號"].astype(str).tolist()
-        allc = df["代號"].astype(str).tolist()
-        cc1, cc2 = st.columns([3, 1])
-        with cc1:
-            full = st.checkbox("含觀察區全部代號", value=False, key="t1_full")
-        with cc2:
-            if st.button("→ 帶到持股監控", key="t1_send"):
-                st.session_state["t2_in"] = " ".join(hot)
-                st.toast(f"已帶入 {len(hot)} 檔到 ② 持股監控")
-        st.text_area("複製給扣抵值 app（🟢觸發 + 🟠準備）",
-                     " ".join(allc if full else hot), height=68, key="t1_copy")
+        watch = df[df["狀態"] == "觀察"]["代號"].astype(str).tolist()
+
+        if st.button("→ 帶到 ② 持股監控", key="t1_send"):
+            st.session_state["t2_in"] = " ".join(hot)
+            st.toast(f"已帶入 {len(hot)} 檔到 ② 持股監控")
+
+        k1, k2 = st.columns(2)
+        with k1:
+            st.text_area(f"🟢觸發 + 🟠準備（{len(hot)} 檔）",
+                         " ".join(hot), height=88, key="t1_copy_hot",
+                         help="今晚的工作區：抄樞紐價、Tab③ 算部位、設券商到價通知。"
+                              "不要丟進扣抵值——這批依定義就在高點附近，"
+                              "扣抵值只會回答「剛噴出，不追」。")
+        with k2:
+            st.text_area(f"🟡觀察 → 扣抵值 app（{len(watch)} 檔）",
+                         " ".join(watch), height=88, key="t1_copy_watch",
+                         help="這批還在整理，才是扣抵值該吃的。"
+                              "出現「窄箱貼頂」的，通常是下週會進準備區的預告。")
         st.download_button("下載 CSV", df[show].to_csv(index=False).encode("utf-8-sig"),
                            file_name=f"minervini_{dt.date.today().isoformat()}.csv",
                            mime="text/csv")
