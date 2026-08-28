@@ -178,6 +178,73 @@ def stage_of(px: pd.DataFrame):
     return stage, round(float(ma_now), 2), not above
 
 
+def find_breakout(px, lookback=90):
+    """自動找最近一次突破日：收盤創 20 日新高且量 > 近50日均量 1.3 倍。回傳 index 位置或 None"""
+    b = px.tail(lookback)
+    c, v = b["close"].values, b["Trading_Volume"].values
+    n = len(c)
+    if n < 30: return None
+    hi20 = pd.Series(c).rolling(20).max().shift(1).values
+    va = pd.Series(v).rolling(50, min_periods=20).mean().shift(1).values
+    hits = [i for i in range(20, n) if c[i] > (hi20[i] or 1e18) and v[i] > (va[i] or 1e18) * 1.15]
+    if not hits:  # 放寬：不看量，只要創 20 日新高
+        hits = [i for i in range(20, n) if c[i] > (hi20[i] or 1e18)]
+    if not hits:
+        return None
+    # 連續創新高視為同一段漲勢，取這一段的「起點」而不是最後一天
+    start = hits[-1]
+    for a, b_ in zip(hits, hits[1:]):
+        pass
+    for k in range(len(hits) - 1, 0, -1):
+        if hits[k] - hits[k - 1] <= 6:
+            start = hits[k - 1]
+        else:
+            break
+    return len(px) - n + start
+
+
+def tennis(px, bo_pos=None):
+    """網球 vs 雞蛋。bo_pos = 突破日在 px 中的整數位置。"""
+    out = dict(judge="⏳觀察中", days=None, peak=None, pull=None,
+               pull_days=None, volr=None, newhigh=False)
+    if bo_pos is None:
+        bo_pos = find_breakout(px)
+    if bo_pos is None:
+        out["judge"] = "—無突破"
+        return out
+    bo_pos = min(bo_pos, len(px) - 1)
+    seg = px.iloc[bo_pos:]
+    c = seg["close"].values; v = seg["Trading_Volume"].values
+    days = len(seg) - 1
+    out["days"] = days
+    bo_price = c[0]
+    peak_i = int(np.argmax(c)); peak = c[peak_i]
+    price = c[-1]
+    out["peak"] = round((peak / bo_price - 1) * 100, 1)
+    out["pull"] = round((price / peak - 1) * 100, 1)
+    out["pull_days"] = len(c) - 1 - peak_i
+    out["newhigh"] = bool(peak_i == len(c) - 1)
+
+    # 上漲段量 vs 回檔段量
+    up_v = v[:peak_i + 1].mean() if peak_i >= 1 else v[0]
+    dn_v = v[peak_i + 1:].mean() if peak_i + 1 < len(v) else np.nan
+    out["volr"] = None if np.isnan(dn_v) or up_v <= 0 else round(dn_v / up_v, 2)
+
+    if days < 5:
+        return out
+    if days > 25:      # 突破太久，網球行為只描述突破後幾天到一兩週
+        out["judge"] = "—突破已久"
+        return out
+    if out["newhigh"] or (out["pull"] >= -8 and out["pull_days"] <= 10
+                          and (out["volr"] is None or out["volr"] < 1.0)):
+        out["judge"] = "🎾網球"
+    elif (out["pull"] <= -12 or out["pull_days"] > 15
+          or (out["volr"] is not None and out["volr"] >= 1.2)):
+        out["judge"] = "🥚雞蛋"
+    else:
+        out["judge"] = "⏳觀察中"
+    return out
+
 # ------------------------------------------------------------------ 主掃描
 
 def scan(m, liq_wan: float, min_days: int = 250):
@@ -253,8 +320,12 @@ st.markdown('<span class="muted">全市場流動性母體 · 趨勢模板 + VCP 
 
 with st.sidebar:
     st.subheader("設定")
+    try:
+        _tok = st.secrets.get("FINMIND_TOKEN", "")
+    except Exception:
+        _tok = ""          # 沒設 secrets 也不要讓整個 app 掛掉
     token = st.text_input("FinMind Token（選填）", type="password",
-                          value=st.secrets.get("FINMIND_TOKEN", ""),
+                          value=_tok,
                           help="只有勾選月營收或法人買賣超時才需要")
     st.caption("行情資料由 GitHub Actions 每日 15:30 更新，不吃 API 額度。")
 
@@ -274,13 +345,13 @@ with tab1:
                                 help="只對非淘汰名單抓，每檔 2 次 API")
 
     if st.button("開始掃描", type="primary", key="t1_go"):
+        st.session_state.pop("scan_df", None)
         m, _ = build_matrices()
         uni = load_universe()
         base = scan(m, liq)
         if base.empty:
             st.error("母體為空，檢查門檻或資料檔。"); st.stop()
 
-        st.caption(f"母體 {len(base)} 檔 · 資料日 {m['c'].index[-1]:%Y-%m-%d}")
         cand = base[base["TT分"] >= min_tt].index
 
         rows, prog = [], st.progress(0.0, text="型態分析中…")
@@ -348,6 +419,17 @@ with tab1:
             df["營收YoY%"] = yoys
             df["法人轉強"] = insts
 
+        st.session_state["scan_df"] = df
+        st.session_state["scan_day"] = f"{m['c'].index[-1]:%Y-%m-%d}"
+        st.session_state["scan_pool"] = len(base)
+
+    # ---- 渲染（放在按鈕外，這樣按「帶到持股監控」不會清空結果）----
+    if "scan_df" in st.session_state:
+        df = st.session_state["scan_df"]
+        want_fund = "營收YoY%" in df.columns
+        st.caption(f"母體 {st.session_state['scan_pool']} 檔 · "
+                   f"資料日 {st.session_state['scan_day']}")
+
         # 狀態統計
         cnt = df["狀態"].value_counts()
         s1, s2, s3, s4 = st.columns(4)
@@ -390,8 +472,17 @@ with tab1:
             st.dataframe(df.groupby("產業").size().sort_values(ascending=False)
                          .rename("檔數").reset_index(), hide_index=True)
 
-        st.text_area("複製代號清單（貼進扣抵值 app）",
-                     " ".join(df["代號"].tolist()), height=68, key="t1_copy")
+        hot = df[df["狀態"].isin(["觸發", "準備"])]["代號"].astype(str).tolist()
+        allc = df["代號"].astype(str).tolist()
+        cc1, cc2 = st.columns([3, 1])
+        with cc1:
+            full = st.checkbox("含觀察區全部代號", value=False, key="t1_full")
+        with cc2:
+            if st.button("→ 帶到持股監控", key="t1_send"):
+                st.session_state["t2_in"] = " ".join(hot)
+                st.toast(f"已帶入 {len(hot)} 檔到 ② 持股監控")
+        st.text_area("複製給扣抵值 app（🟢觸發 + 🟠準備）",
+                     " ".join(allc if full else hot), height=68, key="t1_copy")
         st.download_button("下載 CSV", df[show].to_csv(index=False).encode("utf-8-sig"),
                            file_name=f"minervini_{dt.date.today().isoformat()}.csv",
                            mime="text/csv")
@@ -403,14 +494,21 @@ with tab2:
     st.caption("貼上持股代號，回報階段與出場旗標。含書裡 CROX 案例的爆量最大跌勢警訊。")
     holdings = st.text_area("持股代號（逗號、空白或換行分隔）",
                             placeholder="2330 2454 6488", height=80, key="t2_in")
-    drop_pct = st.slider("回檔警示門檻 %", 5, 30, 15, 1, key="t2_drop")
+    cA, cB = st.columns(2)
+    with cA:
+        drop_pct = st.slider("回檔警示門檻 %", 5, 30, 15, 1, key="t2_drop")
+    with cB:
+        buy_dates = st.text_input("買進日（選填，對應上面順序，YYYY-MM-DD 空白分隔）",
+                                  key="t2_bd",
+                                  help="留白則自動偵測最近一次突破日")
 
     if st.button("檢查持股", type="primary", key="t2_go") and holdings.strip():
         m, _ = build_matrices()
         uni = load_universe()
         ids = [s for s in re.split(r"[,\s]+", holdings.strip()) if s]
+        bds = [s for s in re.split(r"[,\s]+", buy_dates.strip()) if s]
         rows = []
-        for sid in ids:
+        for k, sid in enumerate(ids):
             if sid not in m["c"].columns:
                 rows.append(dict(代號=sid, 名稱="?", 階段="無資料", 現價=None,
                                  距高點=None, 底部序=None, 旗標="?")); continue
@@ -423,6 +521,17 @@ with tab2:
             pull = (price / hi - 1) * 100
             worst, today, volx, alarm = worst_drop(px)
             bc = base_count(px)
+
+            bo_pos = None
+            if k < len(bds):
+                try:
+                    d0 = pd.Timestamp(bds[k])
+                    pos = px.index.searchsorted(d0)
+                    if 0 <= pos < len(px):
+                        bo_pos = int(pos)
+                except Exception:
+                    bo_pos = None
+            tb = tennis(px, bo_pos)
 
             flags = []
             if alarm:
@@ -437,6 +546,8 @@ with tab2:
                 flags.append(f"回檔{pull:.0f}%")
             if bc >= 4:
                 flags.append(f"晚期底部#{bc}")
+            if tb["judge"].startswith("🥚"):
+                flags.append("🥚雞蛋")
 
             rows.append(dict(
                 代號=sid,
@@ -444,6 +555,8 @@ with tab2:
                 階段={2: "上升", 1: "打底", 3: "頭部", 4: "下跌"}.get(stg, "?"),
                 現價=round(price, 2), 距高點=round(pull, 1),
                 今日=today, 量倍=volx, 最大跌=worst, 底部序=bc,
+                網球=tb["judge"], 突破後=tb["days"], 峰漲幅=tb["peak"],
+                距峰=tb["pull"], 回檔天=tb["pull_days"], 回檔量比=tb["volr"],
                 旗標=" ".join(flags) if flags else "✓持有"))
 
         mon = pd.DataFrame(rows)
@@ -455,12 +568,24 @@ with tab2:
             "最大跌": st.column_config.NumberColumn("最大跌%", format="%.1f",
                                                  help="近一年單日最大跌幅"),
             "底部序": st.column_config.NumberColumn("底部#", format="%d"),
+            "網球": st.column_config.TextColumn("網球/雞蛋",
+                help="🎾回檔淺且短且量縮 · 🥚回檔深或拖太久或量放大"),
+            "突破後": st.column_config.NumberColumn("突破後天", format="%d"),
+            "峰漲幅": st.column_config.NumberColumn("峰漲幅%", format="%.1f",
+                help="突破日到最高點的漲幅"),
+            "距峰": st.column_config.NumberColumn("距峰%", format="%.1f"),
+            "回檔天": st.column_config.NumberColumn("回檔天", format="%d"),
+            "回檔量比": st.column_config.NumberColumn("回檔量比", format="%.2f",
+                help="回檔期均量 / 上漲期均量。<1 是好事"),
         })
         st.download_button("下載 CSV", mon.to_csv(index=False).encode("utf-8-sig"),
                            file_name=f"holdings_{dt.date.today().isoformat()}.csv",
                            mime="text/csv")
-        st.caption("🔥爆量最大跌勢＝第2階段以來單日最大跌幅且量放大 1.8 倍以上。"
-                   "書裡明講這通常是賣訊，即使盈餘仍然很好。")
+        st.caption("🔥爆量最大跌勢＝第2階段以來單日最大跌幅且量放大 1.8 倍以上，"
+                   "書裡明講這通常是賣訊，即使盈餘仍然很好。　"
+                   "🎾網球＝突破後拉回淺(≤8%)、短(≤10根)、量縮，或已再創新高；"
+                   "🥚雞蛋＝回檔>12% 或拖過 15 根或量在放大。"
+                   "突破超過 25 天顯示「突破已久」，網球行為只描述突破後幾天到一兩週。")
 
 # ================================================================== TAB 3
 with tab3:
