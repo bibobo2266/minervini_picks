@@ -1,0 +1,38 @@
+name: Update universe
+
+# 代號 → 名稱/產業對照表。新上市股票不會太頻繁，每月一號跑一次就夠。
+# 掃描結果出現「?」時也可以手動跑。免費層即可。
+on:
+  schedule:
+    - cron: '0 1 1 * *'      # 每月 1 號 01:00 UTC = 台北 09:00
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install pandas requests pyarrow
+
+      - name: Update universe
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+        run: python scripts/update_universe.py
+
+      - name: Commit
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/universe.parquet
+          git diff --staged --quiet || git commit -m "universe $(date +%Y-%m-%d)"
+          git pull --rebase || true
+          git push
