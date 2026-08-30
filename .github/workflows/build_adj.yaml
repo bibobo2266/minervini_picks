@@ -1,0 +1,48 @@
+name: Build adjusted
+
+# 用除權息表自己還原，不需要 Backer 訂閱。
+# 第一次跑會抓除權息表（不帶 data_id 成功的話一分鐘，逐檔則約 45 分鐘），
+# 之後 dividend_events.parquet 存在就直接沿用。
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: '起始日期'
+        default: '2017-01-01'
+      dividends_only:
+        description: '只抓除權息表不做還原（true/false）'
+        default: 'false'
+
+permissions:
+  contents: write
+
+jobs:
+  build-adj:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install pandas numpy requests pyarrow
+
+      - name: Build
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+        run: |
+          FLAG=""
+          if [ "${{ inputs.dividends_only }}" = "true" ]; then FLAG="--dividends-only"; fi
+          python scripts/build_adj.py --start ${{ inputs.start }} $FLAG
+
+      - name: Commit
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git diff --staged --quiet || git commit -m "build adj $(date +%Y-%m-%d)"
+          git pull --rebase || true
+          git push
