@@ -1,0 +1,45 @@
+name: Backfill adjusted
+
+# 需要 FinMind Backer 以上。按日期批次抓還原股價，自然包含後來下市的股票。
+# 2015-06 起約 2750 個交易日，2.3 秒/次 → 約 1.8 小時。
+# 超時被砍也沒關係，_done_dates.txt 會記錄進度，再按一次即可續跑。
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: '起始日期（2015-06-01 = 漲跌幅放寬到 10% 的起點）'
+        default: '2015-06-01'
+      limit:
+        description: '只跑前 N 天（0 = 全部，第一次測試填 5）'
+        default: '5'
+
+permissions:
+  contents: write
+
+jobs:
+  backfill-adj:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install pandas requests pyarrow
+
+      - name: Run backfill (adjusted, by date)
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+        run: python scripts/backfill_adj.py --start ${{ inputs.start }} --limit ${{ inputs.limit }}
+
+      - name: Commit
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git diff --staged --quiet || git commit -m "backfill adj $(date +%Y-%m-%d)"
+          git pull --rebase || true
+          git push
