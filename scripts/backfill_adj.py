@@ -61,14 +61,20 @@ def call(dataset: str, **params) -> pd.DataFrame:
             time.sleep(20)
             continue
         js = r.json()
+        msg = str(js.get("msg", ""))
         if js.get("status") not in (200, None):
-            msg = js.get("msg", "")
             if "requests" in msg.lower() or "limit" in msg.lower():
                 print(f"    {msg}，等待 10 分鐘")
                 time.sleep(600)
                 continue
+            # 權限不足 / dataset 不存在之類：重試沒有意義，直接放棄這一檔
+            print(f"    FinMind 拒絕：status={js.get('status')} msg={msg}")
             return pd.DataFrame()
-        return pd.DataFrame(js.get("data", []))
+        data = js.get("data", [])
+        if not data:
+            # 空資料也不重試——之前每檔空轉 5 輪 × 20 秒，30 檔就燒掉 50 分鐘
+            print(f"    回傳空資料：status={js.get('status')} msg={msg}")
+        return pd.DataFrame(data)
     return pd.DataFrame()
 
 
@@ -116,6 +122,18 @@ def main():
     args = ap.parse_args()
 
     os.makedirs(DATA_DIR, exist_ok=True)
+
+    # 先探測一次：免費版可能不支援 TaiwanStockPriceAdj，早點知道比跑 30 檔快
+    probe = call("TaiwanStockPriceAdj", data_id="2330", start_date=args.start)
+    if probe.empty:
+        print("\n>>> TaiwanStockPriceAdj 取不到資料（連 2330 都空）。")
+        print(">>> 多半是免費版不支援還原股價。看上面那行 FinMind 的回應訊息。")
+        print(">>> 若確認如此，改用除權息資料自行還原，或放棄還原股價。")
+        sys.exit(1)
+    print(f"探測 2330：{len(probe)} 列，"
+          f"{probe['date'].min()} ~ {probe['date'].max()}")
+    time.sleep(SLEEP)
+
     uni = universe()
     uni.to_parquet("data/universe.parquet", index=False)
     print(f"母體 {len(uni)} 檔 · 起始 {args.start}")
