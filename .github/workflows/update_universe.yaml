@@ -2,13 +2,19 @@ name: Update universe
 
 # 代號 → 名稱/產業對照表。新上市股票不會太頻繁，每月一號跑一次就夠。
 # 掃描結果出現「?」時也可以手動跑。免費層即可。
+# 排程時間避開整點：GitHub 的排程在 :00 最擁擠，負載高時會延遲甚至直接丟掉。
+# 2026-08-31 那次 daily_adj 的 17:00 首班就是這樣沒觸發。
 on:
   schedule:
-    - cron: '0 1 1 * *'      # 每月 1 號 01:00 UTC = 台北 09:00
+    - cron: '37 1 1 * *'     # 每月 1 號 01:37 UTC = 台北 09:37
   workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: update-universe
+  cancel-in-progress: false
 
 jobs:
   update:
@@ -36,3 +42,11 @@ jobs:
           git diff --staged --quiet || git commit -m "universe $(date +%Y-%m-%d)"
           git pull --rebase || true
           git push
+
+      - name: Report freshness
+        run: |
+          python - <<'PY'
+          import pandas as pd
+          u = pd.read_parquet("data/universe.parquet")
+          print(f"::notice::universe {len(u)} 檔　產業類別 {u['industry_category'].nunique()} 種")
+          PY
