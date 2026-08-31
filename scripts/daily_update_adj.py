@@ -1,4 +1,4 @@
-"""
+r"""
 每日增量（還原股價版）：更新 data/adj/prices_adj_YYYY.parquet
 
 為什麼不能直接把交易所的收盤價 append 進去：
@@ -14,6 +14,17 @@
 
 這樣做的等價說法：因子錨定在「最新價格」，歷史價格隨每次除息往下調。
 跟券商軟體的還原線圖一致，今天的收盤數字永遠等於實際成交價。
+
+母體用 data/universe.parquet 當白名單，不用 regex：
+  舊版用 r"^[1-9]\d{3}$"（首位 1-9 且剛好四位），這條把 487 檔全部濾掉——
+  所有 00 開頭的 ETF（0050、00878）、帶字母的（00981T、00679B）、
+  六位數的（006208）。回補用的是 FinMind 批次端點沒有這條，所以歷史是完整的，
+  是每日增量把它們切掉，導致那 487 檔從 2026-08-31 起靜默停止更新。
+  universe 有 3,141 檔且不含權證（六位數只有 400 檔），拿來當白名單剛好。
+
+當日資料已存在時會「補缺」而不是整批跳過：
+  這樣上面那種漏檔可以靠重跑修復。補缺時不會重新套除權息，
+  因為歷史價格在同一天的第一次執行就已經調過了，再調一次會變成雙重調整。
 
 用法：
     FINMIND_TOKEN=xxx python scripts/daily_update_adj.py
@@ -32,6 +43,10 @@ TWSE = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 TPEX = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
 FINMIND = "https://api.finmindtrade.com/api/v4/data"
 DATA_DIR = "data/adj"
+UNIVERSE = "data/universe.parquet"
+# universe.parquet 讀不到時的退路。刻意放寬到「4-6 位數字 + 可選一個大寫字母」，
+# 寧可多收也不要再靜默漏掉 ETF；真有雜訊會在下面的母體檢查印出來。
+FALLBACK_RE = r"^\d{4,6}[A-Z]?$"
 COLS = ["date", "stock_id", "open", "max", "min", "close",
         "Trading_Volume", "Trading_money"]
 
@@ -124,6 +139,23 @@ def fetch_dividends(day: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def allowlist() -> set:
+    """有效代號白名單。universe.parquet 由 update_universe.yaml 每月更新。"""
+    if os.path.exists(UNIVERSE):
+        try:
+            u = pd.read_parquet(UNIVERSE, columns=["stock_id"])
+            ids = set(u["stock_id"].astype(str).str.strip())
+            if len(ids) >= 1000:
+                return ids
+            print(f"警告：universe 只有 {len(ids)} 檔，看起來不完整，改用 regex")
+        except Exception as e:
+            print(f"警告：讀 universe 失敗 {e}，改用 regex")
+    else:
+        print(f"警告：找不到 {UNIVERSE}，改用 regex。"
+              f"先跑 update_universe.yaml 會比較準。")
+    return set()
+
+
 def year_files() -> dict:
     return {os.path.basename(p)[11:15]: p
             for p in sorted(glob.glob(os.path.join(DATA_DIR,
@@ -184,8 +216,18 @@ def main():
 
     df = pd.concat([tw, tp], ignore_index=True)
     df["date"] = session_date
-    df = df[df["stock_id"].str.match(r"^[1-9]\d{3}$")]
+    raw_n = len(df)
+
+    ids = allowlist()
+    if ids:
+        df = df[df["stock_id"].isin(ids)]
+        print(f"白名單過濾：{raw_n} → {len(df)}（universe {len(ids)} 檔）")
+    else:
+        df = df[df["stock_id"].str.match(FALLBACK_RE)]
+        print(f"regex 過濾：{raw_n} → {len(df)}")
+
     df = df[df["close"].notna() & (df["close"] > 0)]
+    df = df.drop_duplicates(subset=["stock_id"], keep="first")
     df = df.reindex(columns=COLS)
     print(f"清理後 {len(df)} 檔")
 
@@ -194,11 +236,23 @@ def main():
 
     yr = session_date[:4]
     path = os.path.join(DATA_DIR, f"prices_adj_{yr}.parquet")
+
+    # 已有多少當日資料？決定是「新的一天」還是「補缺」。
+    # 補缺時不重新套除權息——歷史在第一次執行就調過了。
+    existing_ids, is_repair = set(), False
     if os.path.exists(path):
-        old = pd.read_parquet(path)
-        if session_date in set(old["date"].astype(str)):
-            print(f"{session_date} 已存在，跳過")
-            return
+        old = pd.read_parquet(path, columns=["date", "stock_id"])
+        existing_ids = set(old.loc[old["date"].astype(str) == session_date,
+                                   "stock_id"])
+        if existing_ids:
+            is_repair = True
+            miss = df[~df["stock_id"].isin(existing_ids)]
+            print(f"{session_date} 已有 {len(existing_ids)} 檔，"
+                  f"本次可補 {len(miss)} 檔")
+            if miss.empty:
+                print("沒有缺漏，結束")
+                return
+            df = miss
 
     if args.dry_run:
         div = fetch_dividends(session_date)
@@ -209,10 +263,13 @@ def main():
 
     # 順序很重要：先調歷史，再 append 今天。
     # 反過來的話今天的價格也會被乘一次，變成雙重調整。
-    div = fetch_dividends(session_date)
-    n = apply_dividends(div)
-    if n:
-        print(f"  已調整 {n:,} 列歷史價格")
+    if is_repair:
+        print("補缺模式：跳過除權息調整（同日第一次執行已經調過）")
+    else:
+        div = fetch_dividends(session_date)
+        n = apply_dividends(div)
+        if n:
+            print(f"  已調整 {n:,} 列歷史價格")
 
     if os.path.exists(path):
         df = pd.concat([pd.read_parquet(path), df], ignore_index=True)
@@ -220,8 +277,20 @@ def main():
     df = df.drop_duplicates(subset=["stock_id", "date"], keep="last")
     df = df.sort_values(["stock_id", "date"]).reset_index(drop=True)
     df.to_parquet(path, index=False, compression="zstd")
+    today_n = int((df["date"] == session_date).sum())
     print(f"已寫入 {os.path.basename(path)}：{df['stock_id'].nunique()} 檔 / "
           f"{len(df):,} 列 / {os.path.getsize(path) / 1e6:.1f} MB")
+    print(f"{session_date} 當日 {today_n} 檔")
+
+    # 跟前一個交易日比對。少 10% 以上通常代表來源改版或又被濾掉一批，
+    # 這種事不會報錯只會靜默累積，所以一定要印出來。
+    days = sorted(set(df["date"].astype(str)))
+    if len(days) >= 2:
+        prev = days[-2]
+        prev_n = int((df["date"] == prev).sum())
+        if prev_n and today_n < prev_n * 0.9:
+            print(f"警告：當日 {today_n} 檔，前一交易日（{prev}）{prev_n} 檔，"
+                  f"少了 {(1 - today_n / prev_n):.0%}。檢查來源或白名單。")
 
 
 if __name__ == "__main__":
