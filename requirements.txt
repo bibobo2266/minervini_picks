@@ -3,6 +3,8 @@ pandas<3
 numpy<3
 requests
 pyarrow
+matplotlib>=3.8
+
 
 
 
