@@ -1,15 +1,25 @@
 name: Daily update (adjusted)
 
-# 每交易日更新 data/adj/。跟舊的 daily.yaml 併存也可以，但建議停用舊的——
-# prices.parquet 是未還原資料，三個 app 換到 adj 之後就不需要了。
+# 每交易日更新 data/adj/。四支 app 全部靠這一條，它停了資料只會安靜地過期。
+#
+# 排程時間的兩個教訓：
+# 1. 不要用整點。GitHub 的排程在 :00 最擁擠，負載高時會延遲甚至直接丟掉，
+#    2026-08-31 那次 17:00 的第一班就是這樣沒觸發。改成 :23 這種零碎分鐘。
+# 2. 排兩班。daily_update_adj.py 是冪等的（當日資料已存在就直接跳過），
+#    所以第二班只在第一班漏掉時才真的做事，重複跑不會弄壞資料。
 on:
   schedule:
-    # 09:00 UTC = 台北 17:00
-    - cron: '0 9 * * 1-5'
+    - cron: '23 9 * * 1-5'    # 09:23 UTC = 台北 17:23（主要）
+    - cron: '23 12 * * 1-5'   # 12:23 UTC = 台北 20:23（補跑，第一班沒跑到才會寫入）
   workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  # 兩班萬一撞在一起，讓後面那班等前面跑完，避免同時寫同一個 parquet
+  group: daily-adj
+  cancel-in-progress: false
 
 jobs:
   update:
@@ -38,3 +48,14 @@ jobs:
           git diff --staged --quiet || git commit -m "data adj $(date +%Y-%m-%d)"
           git pull --rebase || true
           git push
+
+      - name: Report freshness
+        # 把資料最新日印在 log 最後一行，翻執行紀錄時一眼看得到有沒有真的更新
+        run: |
+          python - <<'PY'
+          import glob, pandas as pd
+          fs = sorted(glob.glob("data/adj/prices_adj_*.parquet"))
+          if fs:
+              d = pd.read_parquet(fs[-1], columns=["date", "stock_id"])
+              print(f"::notice::資料最新日 {d['date'].max()}　檔數 {d['stock_id'].nunique()}")
+          PY
