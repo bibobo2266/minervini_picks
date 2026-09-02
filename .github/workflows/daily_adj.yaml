@@ -7,10 +7,10 @@ name: Daily update (adjusted)
 #    2026-08-31 那次 17:00 的第一班就是這樣沒觸發。改成 :23 這種零碎分鐘。
 # 2. 排兩班。daily_update_adj.py 是冪等的（當日資料已存在就直接跳過），
 #    所以第二班只在第一班漏掉時才真的做事，重複跑不會弄壞資料。
+# 排程由 cron-job.org 從外部觸發（POST 到 Actions dispatch API）。
+# GitHub 內建的 cron 是 best-effort，實測 2026-09-01 延遲超過 5 小時，
+# 而 workflow_dispatch 走不同佇列，幾乎即時。
 on:
-  schedule:
-    - cron: '23 9 * * 1-5'    # 09:23 UTC = 台北 17:23（主要）
-    - cron: '23 12 * * 1-5'   # 12:23 UTC = 台北 20:23（補跑，第一班沒跑到才會寫入）
   workflow_dispatch:
 
 permissions:

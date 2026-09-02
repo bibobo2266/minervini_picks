@@ -1,9 +1,7 @@
-name: Update universe
+name: Weekly snapshot
 
-# 代號 → 名稱/產業對照表。新上市股票不會太頻繁，每月一號跑一次就夠。
-# 掃描結果出現「?」時也可以手動跑。免費層即可。
 # 排程時間避開整點：GitHub 的排程在 :00 最擁擠，負載高時會延遲甚至直接丟掉。
-# 2026-08-31 那次 daily_adj 的 17:00 首班就是這樣沒觸發。
+# 2026-08-31 那次 minervini_picks 的 daily_adj 17:00 首班就是這樣沒觸發。
 # 排程由 cron-job.org 從外部觸發（POST 到 Actions dispatch API）。
 # GitHub 內建的 cron 是 best-effort，實測 2026-09-01 延遲超過 5 小時，
 # 而 workflow_dispatch 走不同佇列，幾乎即時。
@@ -14,13 +12,13 @@ permissions:
   contents: write
 
 concurrency:
-  group: update-universe
+  group: weekly-snapshot
   cancel-in-progress: false
 
 jobs:
-  update:
+  snapshot:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -28,19 +26,17 @@ jobs:
         with:
           python-version: '3.11'
 
-      - run: pip install pandas requests pyarrow
+      - run: pip install pandas numpy requests pyarrow
 
-      - name: Update universe
-        env:
-          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
-        run: python scripts/update_universe.py
+      - name: Snapshot stages
+        run: python scripts/snapshot.py
 
       - name: Commit
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/universe.parquet
-          git diff --staged --quiet || git commit -m "universe $(date +%Y-%m-%d)"
+          git add data/
+          git diff --staged --quiet || git commit -m "stages $(date +%Y-%m-%d)"
           git pull --rebase || true
           git push
 
@@ -48,6 +44,7 @@ jobs:
         run: |
           python - <<'PY'
           import pandas as pd
-          u = pd.read_parquet("data/universe.parquet")
-          print(f"::notice::universe {len(u)} 檔　產業類別 {u['industry_category'].nunique()} 種")
+          s = pd.read_parquet("data/stages.parquet")
+          col = "date" if "date" in s.columns else s.columns[0]
+          print(f"::notice::stages 最新 {s[col].max()}　{len(s):,} 列")
           PY

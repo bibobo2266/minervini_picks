@@ -1,0 +1,63 @@
+name: Report - Stan (weekly)
+
+# 排在 Stan_stages 的 snapshot（週六 09:37）之後。
+# 跨 repo 讀 stages.parquet，所以要留時間給對面 commit + raw 快取更新。
+# 排程由 cron-job.org 從外部觸發（POST 到 Actions dispatch API）。
+# GitHub 內建的 cron 是 best-effort，實測 2026-09-01 延遲超過 5 小時，
+# 而 workflow_dispatch 走不同佇列，幾乎即時。
+on:
+  workflow_dispatch:
+    inputs:
+      top:
+        description: '最多出幾張教學圖'
+        default: '20'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: report-weekly
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install pandas numpy requests pyarrow matplotlib
+
+      - name: Build report
+        run: python scripts/report_stan.py --top ${{ inputs.top || 20 }}
+
+      - name: Collect attachments
+        id: att
+        run: |
+          ls -la out/
+          # 日期在 shell 裡算，YAML 字串裡的 $(date) 不會被展開
+          echo "date=$(date +%Y-%m-%d)" >> $GITHUB_OUTPUT
+          # 沒有名單時 zip 不存在，附件清單要動態組，不然 send-mail 會紅掉
+          FILES=$(ls out/*.csv out/*.zip 2>/dev/null | paste -sd, -)
+          echo "files=$FILES" >> $GITHUB_OUTPUT
+          echo "body<<EOF" >> $GITHUB_OUTPUT
+          cat out/summary.txt >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Send mail
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.GMAIL_USER }}
+          password: ${{ secrets.GMAIL_APP_PASSWORD }}
+          from: Stan Stages <${{ secrets.GMAIL_USER }}>
+          to: ${{ secrets.MAIL_TO }}
+          subject: "Stan 階段報表 ${{ steps.att.outputs.date }}"
+          body: ${{ steps.att.outputs.body }}
+          attachments: ${{ steps.att.outputs.files }}

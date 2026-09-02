@@ -1,0 +1,73 @@
+name: Report - Minervini (daily)
+
+# 串接在 watchlist 之後，不用固定時間。
+# 整條鏈是：daily_adj（外部觸發）→ watchlist → report。
+# 報表寄出的內容必須反映已經更新過的名單，猜時間做不到這件事。
+on:
+  workflow_run:
+    workflows: ["Watchlist update (daily)"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      top:
+        description: '最多出幾張教學圖'
+        default: '20'
+      min_tt:
+        description: '最低趨勢模板分數'
+        default: '8'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: report-daily
+  cancel-in-progress: false
+
+jobs:
+  report:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install pandas numpy requests pyarrow matplotlib
+
+      - name: Build report
+        run: |
+          python scripts/report_minervini.py \
+            --top ${{ inputs.top || 20 }} \
+            --min-tt ${{ inputs.min_tt || 8 }}
+
+      - name: Collect attachments
+        id: att
+        run: |
+          ls -la out/
+          # 日期在 shell 裡算，YAML 字串裡的 $(date) 不會被展開
+          echo "date=$(date +%Y-%m-%d)" >> $GITHUB_OUTPUT
+          # 沒有名單時 zip 不存在，附件清單要動態組，不然 send-mail 會紅掉
+          FILES=$(ls out/*.csv out/*.zip 2>/dev/null | paste -sd, -)
+          echo "files=$FILES" >> $GITHUB_OUTPUT
+          echo "body<<EOF" >> $GITHUB_OUTPUT
+          cat out/summary.txt >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Send mail
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.GMAIL_USER }}
+          password: ${{ secrets.GMAIL_APP_PASSWORD }}
+          from: Minervini Scanner <${{ secrets.GMAIL_USER }}>
+          to: ${{ secrets.MAIL_TO }}
+          subject: "Minervini 選股 ${{ steps.att.outputs.date }}"
+          body: ${{ steps.att.outputs.body }}
+          attachments: ${{ steps.att.outputs.files }}

@@ -1,0 +1,84 @@
+name: Watchlist update (daily)
+
+# 每交易日更新 data/watchlist.csv。
+#
+# 不用固定時間排程，改成串接在 daily_adj 之後。
+# 理由：GitHub 的 cron 是 best-effort，實測 2026-09-01 延遲超過 5 小時。
+# 猜時間的話上游一延遲，這裡就拿舊資料更新名單——而名單是有狀態的，
+# 在榜天數會照加、逾期會照判，寫壞了不可逆。
+# 串接之後上游延遲多久都不影響正確性，只是整條鏈跟著晚。
+on:
+  workflow_run:
+    workflows: ["Daily update (adjusted)"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '只看不寫（true / false）'
+        default: 'false'
+      liq:
+        description: '60日均額門檻（萬元）'
+        default: '5000'
+
+permissions:
+  contents: write
+
+concurrency:
+  # 名單是有狀態的檔案，兩個 job 同時寫會互相覆蓋
+  group: watchlist
+  cancel-in-progress: false
+
+jobs:
+  update:
+    # 上游失敗就不要跑。workflow_run 不管成功失敗都會觸發，要自己擋。
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install pandas numpy requests pyarrow
+
+      - name: Check data freshness
+        # 名單依賴當日行情。daily_adj 沒跑成功的話，這裡會拿昨天的資料
+        # 更新名單，在榜天數照加、移出照判——那是錯的。寧可不跑。
+        run: |
+          python - <<'PY'
+          import glob, sys, datetime as dt
+          import pandas as pd
+          fs = sorted(glob.glob("data/adj/prices_adj_*.parquet"))
+          if not fs:
+              sys.exit("找不到行情檔")
+          d = pd.read_parquet(fs[-1], columns=["date"])
+          last = pd.to_datetime(d["date"]).max().date()
+          today = dt.date.today()
+          gap = (today - last).days
+          print(f"::notice::行情最新日 {last}（距今 {gap} 天）")
+          if gap > 4:
+              sys.exit(f"行情已過期 {gap} 天，不更新名單。先修 daily_adj。")
+          PY
+
+      - name: Update watchlist
+        run: |
+          python scripts/watchlist_update.py \
+            --liq ${{ inputs.liq || 5000 }} \
+            ${{ inputs.dry_run == 'true' && '--dry-run' || '' }}
+
+      - name: Stats
+        run: python scripts/watchlist_update.py --stats
+
+      - name: Commit
+        if: inputs.dry_run != 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/watchlist.csv data/watchlist_history.csv
+          git diff --staged --quiet || git commit -m "watchlist $(date +%Y-%m-%d)"
+          git pull --rebase || true
+          git push
