@@ -224,6 +224,45 @@ def apply_dividends(div: pd.DataFrame) -> int:
     return touched
 
 
+
+# 寫入前要跟上一個交易日比對的欄位。全部相同 = 那一列根本沒動過。
+DUP_COLS = ["open", "max", "min", "close", "Trading_Volume"]
+DUP_LIMIT = 0.30      # 超過這個比例完全相同就中止
+DUP_MIN_N = 200       # 樣本太少時比例沒有意義，不判
+
+
+def stale_ratio(new: pd.DataFrame, path: str, session_date: str):
+    """跟資料庫裡上一個交易日比對，回傳 (完全相同的比例, 比對檔數, 上一交易日)。
+
+    2026-09-02 踩到的坑：TWSE 端點回的是前一個交易日的資料，但腳本用 TPEx
+    回報的日期當作當日日期，於是把舊資料寫在新日期底下——1289 檔上市股票
+    全部是複製的，而且不會報任何錯。這種汙染只有事後拿兩天對照才看得出來。
+
+    正常情況下相鄰交易日 OHLCV 完全相同的比例是 0-1%（實測 8/26→8/27 為 0%、
+    8/27→8/28 為 1%）；出問題那兩天是 57% 與 58%。門檻取 30%，中間留很大餘裕。
+    """
+    if not os.path.exists(path):
+        return 0.0, 0, None
+    try:
+        old = pd.read_parquet(path)
+    except Exception as e:
+        print(f"警告：讀不到既有檔案做比對（{e}），跳過重複檢查")
+        return 0.0, 0, None
+    old["date"] = old["date"].astype(str)
+    prev_days = sorted(d for d in old["date"].unique() if d < session_date)
+    if not prev_days:
+        return 0.0, 0, None
+    prev = prev_days[-1]
+    a = old[old["date"] == prev].set_index("stock_id")
+    b = new.set_index("stock_id")
+    cols = [c for c in DUP_COLS if c in a.columns and c in b.columns]
+    ix = a.index.intersection(b.index)
+    if len(ix) < DUP_MIN_N or not cols:
+        return 0.0, len(ix), prev
+    same = (a.loc[ix, cols] == b.loc[ix, cols]).all(axis=1)
+    return float(same.mean()), len(ix), prev
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
@@ -259,6 +298,18 @@ def main():
 
     if len(df) < 800:
         sys.exit(f"筆數異常偏少（{len(df)}），可能是休市或 API 改版，不寫入")
+
+    yr_probe = session_date[:4]
+    probe_path = os.path.join(DATA_DIR, f"prices_adj_{yr_probe}.parquet")
+    dup, dup_n, prev_day = stale_ratio(df, probe_path, session_date)
+    if dup_n:
+        print(f"與上一交易日（{prev_day}）比對 {dup_n} 檔，"
+              f"OHLCV 完全相同 {dup:.0%}")
+    if dup >= DUP_LIMIT:
+        sys.exit(
+            f"中止：{dup:.0%} 的股票與 {prev_day} 完全相同（門檻 {DUP_LIMIT:.0%}）。"
+            f"多半是來源還沒更新當日資料，寫進去會用舊價汙染 {session_date}。"
+            f"稍後再跑一次；若持續發生，檢查 TWSE / TPEx 端點的發布時間。")
 
     yr = session_date[:4]
     path = os.path.join(DATA_DIR, f"prices_adj_{yr}.parquet")
