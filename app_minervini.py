@@ -1,15 +1,8 @@
 """
-Minervini SEPA Scanner — Taiwan stocks (parquet edition)
+Minervini SEPA Scanner — Streamlit 介面
 
-資料來源改為 GitHub Actions 每日更新的 data/prices.parquet（全市場 ~2000 檔），
-不再逐檔打 FinMind。掃描從 1-2 分鐘降到 2-3 秒，且不吃 API 額度。
-
-三個分頁：
-1. 選股 — 流動性母體 → Stage 2 → 趨勢模板 → VCP → 五色狀態分流
-2. 持股監控 — 貼代號，回報階段 + 出場旗標（含爆量最大跌幅）
-3. 進場計算 — 樞紐 / 停損 / 部位大小
-
-FinMind token 只有在勾選「月營收」或「法人買賣超」時才需要，且只對最終名單抓。
+掃描邏輯全在 minervini_core.py，這支只負責 UI。
+每日報表 scripts/report_minervini.py 走同一份 core。
 """
 import datetime as dt
 import io
@@ -20,320 +13,9 @@ import pandas as pd
 import requests
 import streamlit as st
 
+from minervini_core import *      # noqa: F401,F403
+
 st.set_page_config(page_title="Minervini SEPA · 選股", page_icon="◈", layout="wide")
-
-REPO = "bibobo2266/minervini_picks"
-BRANCH = "main"
-RAW = f"https://raw.githubusercontent.com/{REPO}/{BRANCH}"
-ADJ_URL = RAW + "/data/adj/prices_adj_{year}.parquet"
-UNIVERSE_URL = RAW + "/data/universe.parquet"
-YEARS_DEFAULT = 3          # 日常只需要近幾年：200日均線 + 52週高低最多用到一年多
-FINMIND = "https://api.finmindtrade.com/api/v4/data"
-
-MA_WEEKS = 30
-DEFAULT_RISK_PCT = 1.25
-DEFAULT_LIQ = 5000          # 萬元，60 日均額門檻
-
-STATES = {
-    "觸發": ("🟢", "突破樞紐 + 量價確認"),
-    "準備": ("🟠", "VCP 接近完成，樞紐已能辨識"),
-    "觀察": ("🟡", "基本條件好，但 Base/VCP 未完成"),
-    "淘汰": ("🔴", "前面資格不合格"),
-}
-
-# ------------------------------------------------------------------ 資料載入
-
-@st.cache_data(ttl=60 * 60 * 4, show_spinner="讀取行情資料…")
-def load_parquet(url: str) -> pd.DataFrame:
-    r = requests.get(url, timeout=180)
-    r.raise_for_status()
-    return pd.read_parquet(io.BytesIO(r.content))
-
-
-@st.cache_data(ttl=60 * 60 * 4, show_spinner="讀取行情資料…")
-def load_prices(years: int = YEARS_DEFAULT, as_of=None) -> pd.DataFrame:
-    """讀還原股價。分年存檔，只載需要的年份——十一年共 169MB，全載會拖垮
-    Streamlit Cloud 的記憶體，而日常掃描最多只用到一年多的歷史。"""
-    end = pd.Timestamp(as_of) if as_of else pd.Timestamp.today()
-    yrs = list(range(end.year - years + 1, end.year + 1))
-    parts = []
-    for y in yrs:
-        try:
-            parts.append(load_parquet(ADJ_URL.format(year=y)))
-        except Exception:
-            pass                                # 該年份檔不存在就跳過
-    if not parts:
-        raise RuntimeError("讀不到任何 data/adj/ 年份檔")
-    df = pd.concat(parts, ignore_index=True)
-    df["date"] = pd.to_datetime(df["date"])
-    if as_of:
-        df = df[df["date"] <= pd.Timestamp(as_of)]
-    return df
-
-
-@st.cache_data(ttl=60 * 60 * 4, show_spinner=False)
-def build_matrices(years: int = YEARS_DEFAULT, as_of=None):
-    """把長表轉成 date × stock_id 的寬矩陣，之後所有計算都向量化。"""
-    df = load_prices(years, as_of)
-    # 還原股價的母體含 ETF、興櫃、下市股（2841 檔）。四碼、開頭非 0 才是普通股。
-    df = df[df["stock_id"].astype(str).str.match(r"^[1-9]\d{3}$")]
-    m = {}
-    for k, col in [("c", "close"), ("h", "max"), ("l", "min"),
-                   ("v", "Trading_Volume"), ("mo", "Trading_money")]:
-        m[k] = df.pivot(index="date", columns="stock_id", values=col).sort_index()
-    # 停牌日會出現整列 0。這些 0 會把 52 週低點壓成 0（讓趨勢模板第 6 條
-    # 永遠通過）、拉低均線、算出 -100% 的漲跌幅。一律當成缺值處理。
-    bad = m["c"] <= 0
-    for k in ("c", "h", "l"):
-        m[k] = m[k].mask(bad).ffill()          # 價格沿用前一交易日
-    for k in ("v", "mo"):
-        m[k] = m[k].mask(bad)                  # 量與額留白，不要用 0 拉低均量
-    return m, df
-
-
-@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
-def load_universe() -> pd.DataFrame:
-    return load_parquet(UNIVERSE_URL).set_index("stock_id")
-
-
-@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
-def finmind(dataset: str, token: str, **kw) -> pd.DataFrame:
-    """單次 FinMind 呼叫，失敗回空表。"""
-    try:
-        r = requests.get(FINMIND, params={"dataset": dataset, "token": token, **kw},
-                         timeout=30)
-        if r.status_code != 200:
-            return pd.DataFrame()
-        return pd.DataFrame(r.json().get("data", []))
-    except Exception:
-        return pd.DataFrame()
-
-
-# ------------------------------------------------------------------ 型態偵測
-
-def zigzag(h, l, pct=6.0):
-    """交錯轉折點 [(idx, price, 'H'|'L')]，回檔/反彈超過 pct% 才算一個轉折。"""
-    n = len(h)
-    if n < 10:
-        return []
-    piv, d, ei, ep = [], 0, 0, h[0]
-    for i in range(1, n):
-        if d >= 0 and h[i] > ep:
-            ei, ep = i, h[i]
-        if d < 0 and l[i] < ep:
-            ei, ep = i, l[i]
-        if d >= 0:
-            if l[i] <= ep * (1 - pct / 100):
-                piv.append((ei, ep, "H")); d = -1; ei, ep = i, l[i]
-        else:
-            if h[i] >= ep * (1 + pct / 100):
-                piv.append((ei, ep, "L")); d = 1; ei, ep = i, h[i]
-    piv.append((ei, ep, "H" if d >= 0 else "L"))
-    return piv
-
-
-def vcp_foot(px: pd.DataFrame, pct=6.0):
-    """VCP 足跡。回傳 dict：footprint 字串、收縮次數、最右跌幅、是否收縮、樞紐價。"""
-    out = dict(foot="", n=0, first=None, last=None, ok=False, pivot=None, near=False)
-    b = px.tail(120)
-    if len(b) < 40:
-        return out
-    h, l = b["max"].values, b["min"].values
-    piv = zigzag(h, l, pct)
-    depths, starts = [], []
-    for i in range(len(piv) - 1):
-        if piv[i][2] == "H" and piv[i + 1][2] == "L":
-            depths.append(round((piv[i][1] - piv[i + 1][1]) / piv[i][1] * 100, 1))
-            starts.append(piv[i][0])
-    price = float(b["close"].iloc[-1])
-    pivot = round(float(b["max"].tail(20).max()), 2)
-    out.update(pivot=pivot, near=bool(price >= pivot * 0.97))
-    if len(depths) < 2:
-        out.update(n=len(depths))
-        return out
-    depths, starts = depths[-4:], starts[-4:]
-    wk = max(2, (len(b) - min(starts)) // 5)
-    # 主判定用振幅收縮（比轉折點計數穩健）：把底部切三段比日振幅
-    a = ((b["max"] - b["min"]) / b["close"] * 100).tail(60).values
-    seg = len(a) // 3
-    s1, s2, s3 = a[:seg].mean(), a[seg:2 * seg].mean(), a[2 * seg:].mean()
-    vol = b["Trading_Volume"].tail(60).values
-    dry = vol[-10:].mean() <= vol[:-10].mean() * 1.05
-    ok = bool(s3 <= s1 * 0.75 and s3 <= s2 * 1.05 and s3 <= 6.0 and dry)
-    out.update(foot=f"{wk}W-{depths[0]:.0f}/{depths[-1]:.0f}-{len(depths)}T",
-               n=len(depths), first=depths[0], last=depths[-1], ok=ok)
-    return out
-
-
-def base_count(px: pd.DataFrame, thr=12.0, min_bars=15, lookback=378):
-    """底部序號。自峰值回檔 ≥thr% 且持續 ≥min_bars 根，再創新高 = 完成一個底部。
-    書裡：第 1、2 底最佳，第 3 底尚可，第 4、5 底已邁入後期。"""
-    b = px.tail(lookback)
-    c, h = b["close"].values, b["max"].values
-    if len(c) < 60:
-        return 0
-    peak, pk_i, n, in_base, bs = h[0], 0, 0, False, 0
-    for i in range(len(c)):
-        if h[i] > peak:
-            if in_base and (i - bs) >= min_bars:
-                n += 1
-            in_base, peak, pk_i = False, h[i], i
-        elif not in_base and c[i] <= peak * (1 - thr / 100):
-            in_base, bs = True, pk_i
-    return min(6, n + (1 if in_base else 0))
-
-
-def worst_drop(px: pd.DataFrame, lookback=252):
-    """單日最大跌幅 / 今日跌幅 / 量能倍數 / 是否觸發爆量最大跌勢警訊。
-    書裡 CROX 案例：第 2 階段以來的單日最大跌勢 + 爆量 = 賣訊，即使盈餘很好。"""
-    b = px.tail(lookback)
-    r = b["close"].pct_change() * 100
-    v = b["Trading_Volume"]
-    worst, today = r.min(), r.iloc[-1]
-    volx = v.iloc[-1] / v.iloc[-51:-1].mean() if len(v) > 51 else 1.0
-    alarm = bool(today <= worst * 0.95 and today < -4 and volx > 1.8)
-    return round(float(worst), 1), round(float(today), 1), round(float(volx), 2), alarm
-
-
-def stage_of(px: pd.DataFrame):
-    """Weinstein 階段（30 週線 + 斜率）。"""
-    w = px["close"].resample("W-FRI").last().dropna()
-    if len(w) < MA_WEEKS + 5:
-        return None, None, None
-    ma = w.rolling(MA_WEEKS).mean()
-    price, ma_now = w.iloc[-1], ma.iloc[-1]
-    slope = ma.diff(4).iloc[-1]
-    above = price > ma_now
-    stage = 2 if (above and slope > 0) else 4 if (not above and slope < 0) \
-        else 3 if above else 1
-    return stage, round(float(ma_now), 2), not above
-
-
-def find_breakout(px, lookback=90):
-    """自動找最近一次突破日：收盤創 20 日新高且量 > 近50日均量 1.3 倍。回傳 index 位置或 None"""
-    b = px.tail(lookback)
-    c, v = b["close"].values, b["Trading_Volume"].values
-    n = len(c)
-    if n < 30: return None
-    hi20 = pd.Series(c).rolling(20).max().shift(1).values
-    va = pd.Series(v).rolling(50, min_periods=20).mean().shift(1).values
-    hits = [i for i in range(20, n) if c[i] > (hi20[i] or 1e18) and v[i] > (va[i] or 1e18) * 1.15]
-    if not hits:  # 放寬：不看量，只要創 20 日新高
-        hits = [i for i in range(20, n) if c[i] > (hi20[i] or 1e18)]
-    if not hits:
-        return None
-    # 連續創新高視為同一段漲勢，取這一段的「起點」而不是最後一天
-    start = hits[-1]
-    for a, b_ in zip(hits, hits[1:]):
-        pass
-    for k in range(len(hits) - 1, 0, -1):
-        if hits[k] - hits[k - 1] <= 6:
-            start = hits[k - 1]
-        else:
-            break
-    return len(px) - n + start
-
-
-def tennis(px, bo_pos=None):
-    """網球 vs 雞蛋。bo_pos = 突破日在 px 中的整數位置。"""
-    out = dict(judge="⏳觀察中", days=None, peak=None, pull=None,
-               pull_days=None, volr=None, newhigh=False)
-    if bo_pos is None:
-        bo_pos = find_breakout(px)
-    if bo_pos is None:
-        out["judge"] = "—無突破"
-        return out
-    bo_pos = min(bo_pos, len(px) - 1)
-    seg = px.iloc[bo_pos:]
-    c = seg["close"].values; v = seg["Trading_Volume"].values
-    days = len(seg) - 1
-    out["days"] = days
-    bo_price = c[0]
-    peak_i = int(np.argmax(c)); peak = c[peak_i]
-    price = c[-1]
-    out["peak"] = round((peak / bo_price - 1) * 100, 1)
-    out["pull"] = round((price / peak - 1) * 100, 1)
-    out["pull_days"] = len(c) - 1 - peak_i
-    out["newhigh"] = bool(peak_i == len(c) - 1)
-
-    # 上漲段量 vs 回檔段量
-    up_v = v[:peak_i + 1].mean() if peak_i >= 1 else v[0]
-    dn_v = v[peak_i + 1:].mean() if peak_i + 1 < len(v) else np.nan
-    out["volr"] = None if np.isnan(dn_v) or up_v <= 0 else round(dn_v / up_v, 2)
-
-    if days < 5:
-        return out
-    if days > 25:      # 突破太久，網球行為只描述突破後幾天到一兩週
-        out["judge"] = "—突破已久"
-        return out
-    if out["newhigh"] or (out["pull"] >= -8 and out["pull_days"] <= 10
-                          and (out["volr"] is None or out["volr"] < 1.0)):
-        out["judge"] = "🎾網球"
-    elif (out["pull"] <= -12 or out["pull_days"] > 15
-          or (out["volr"] is not None and out["volr"] >= 1.2)):
-        out["judge"] = "🥚雞蛋"
-    else:
-        out["judge"] = "⏳觀察中"
-    return out
-
-# ------------------------------------------------------------------ 主掃描
-
-def scan(m, liq_wan: float, min_days: int = 250):
-    """向量化計算全母體的趨勢模板、RS、量比。回傳 DataFrame。"""
-    c, h, l, v, mo = m["c"], m["h"], m["l"], m["v"], m["mo"]
-    keep = (mo.tail(60).mean() > liq_wan * 1e4) & (c.notna().sum() >= min_days)
-    ids = keep[keep].index
-    if len(ids) == 0:
-        return pd.DataFrame()
-    c, h, l, v, mo = [x[ids] for x in (c, h, l, v, mo)]
-
-    ma50 = c.rolling(50).mean()
-    ma150 = c.rolling(150).mean()
-    ma200 = c.rolling(200).mean()
-    px = c.iloc[-1]
-    m50, m150, m200, m200_1mo = ma50.iloc[-1], ma150.iloc[-1], ma200.iloc[-1], ma200.iloc[-22]
-    lo52, hi52 = l.tail(252).min(), h.tail(252).max()
-
-    r126 = c.iloc[-1] / c.iloc[-127] - 1
-    r63 = c.iloc[-1] / c.iloc[-64] - 1
-    rs = (0.6 * r126 + 0.4 * r63).rank(pct=True) * 100
-
-    cond = pd.DataFrame({
-        "c1": (px > m150) & (px > m200),          # 股價高於 150 / 200 日均
-        "c2": m150 > m200,
-        "c3": m200 > m200_1mo,                     # 200 日均上升中
-        "c4": (m50 > m150) & (m150 > m200),        # 均線多頭排列
-        "c5": px > m50,
-        "c6": px >= lo52 * 1.30,                   # 高於 52 週低點 30%
-        "c7": px >= hi52 * 0.75,                   # 距 52 週高點 25% 內
-        "c8": rs >= 70,
-    })
-    v5, v10 = v.tail(5).mean(), v.tail(10).mean()
-
-    return pd.DataFrame({
-        "收盤": px.round(2),
-        "RS": rs.round(0),
-        "TT分": cond.sum(axis=1),
-        "TT全符": cond.sum(axis=1) == 8,
-        "距高點": ((px / hi52 - 1) * 100).round(1),
-        "量比": (v5 / v10).round(2),
-        "量增": v5 > v10,
-        "均額億": (mo.tail(60).mean() / 1e8).round(2),
-        "MA50": m50.round(2),
-    })
-
-
-def classify(row) -> str:
-    """五色分流。觸發要求靠近 52 週高——書裡買點在新高附近，不是任何 20 日高。"""
-    if row["TT分"] < 6 or row["階段"] != 2:
-        return "淘汰"
-    near_hi = row["距高點"] >= -10
-    if row["突破"] and row["量增"] and row["TT分"] >= 7 and near_hi:
-        return "觸發"
-    if row["近樞紐"] and near_hi and (row["VCP"] or row["TT分"] >= 7):
-        return "準備"
-    return "觀察"
-
 
 # ------------------------------------------------------------------ 樣式
 
@@ -372,7 +54,8 @@ with st.sidebar:
         yrs = st.slider("往前載入幾年", 2, 5, 3,
                         help="趨勢模板最多用到一年多的歷史。載越多年越慢。")
 
-tab1, tab2, tab3 = st.tabs(["① 選股", "② 持股監控", "③ 進場計算"])
+tab1, tab2, tab3, tab4 = st.tabs(["① 選股", "② 持股監控", "③ 進場計算",
+                                  "④ 準備名單追蹤"])
 
 # ================================================================== TAB 1
 with tab1:
@@ -744,3 +427,153 @@ with tab3:
                                sheet.to_csv(index=False).encode("utf-8-sig"),
                                file_name=f"orders_{dt.date.today().isoformat()}.csv",
                                mime="text/csv")
+
+
+# ================================================================== TAB 4
+with tab4:
+    st.subheader("準備名單追蹤")
+    st.caption("名單由 scripts/watchlist_update.py 每日機械更新。"
+               "這裡只讀不寫——判斷留給人，執行留給腳本。")
+
+    def _load_csv(path: str, url_path: str) -> pd.DataFrame:
+        """本機優先。Streamlit Cloud 會 checkout repo，所以通常讀得到本機檔。"""
+        import os
+        if os.path.exists(path):
+            return pd.read_csv(path, dtype={"代號": str})
+        r = requests.get(RAW + url_path, timeout=60)
+        if r.status_code != 200:
+            return pd.DataFrame()
+        return pd.read_csv(io.BytesIO(r.content), dtype={"代號": str})
+
+    wl = _load_csv("data/watchlist.csv", "/data/watchlist.csv")
+    hist = _load_csv("data/watchlist_history.csv", "/data/watchlist_history.csv")
+
+    if wl.empty:
+        st.info("還沒有名單。先讓 watchlist_update.py 跑過一次。")
+    else:
+        wl["在榜天數"] = pd.to_numeric(wl["在榜天數"], errors="coerce")
+        n_trig = int(wl["觸發日"].notna().sum())
+        soon = wl[(wl["觸發日"].isna()) & (wl["在榜天數"] >= 8 * 7 - 7)]
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("在榜", len(wl))
+        c2.metric("已觸發", n_trig)
+        c3.metric("一週內逾期", len(soon))
+        c4.metric("平均在榜天數", f"{wl['在榜天數'].mean():.0f}")
+
+        if len(soon):
+            st.warning("一週內逾期：" + "、".join(
+                f"{r['代號']} {r['名稱']}（第 {r['在榜天數']:.0f} 天）"
+                for _, r in soon.iterrows()))
+
+        only_trig = st.checkbox("只看已觸發", value=False, key="t4_trig")
+        view = wl[wl["觸發日"].notna()] if only_trig else wl
+        st.dataframe(
+            view.drop(columns=["移出日", "移出原因"], errors="ignore"),
+            use_container_width=True, hide_index=True, height=420,
+            column_config={
+                "進榜價": st.column_config.NumberColumn(format="%.1f"),
+                "最新價": st.column_config.NumberColumn(format="%.1f"),
+                "進榜樞紐": st.column_config.NumberColumn("樞紐", format="%.1f"),
+                "停損價": st.column_config.NumberColumn(format="%.1f"),
+                "進榜RS": st.column_config.NumberColumn("進榜RS", format="%.0f"),
+                "最新RS": st.column_config.NumberColumn(format="%.0f"),
+                "在榜天數": st.column_config.NumberColumn(format="%d"),
+                "進榜VCP": st.column_config.CheckboxColumn("VCP"),
+            })
+
+        d1, d2 = st.columns(2)
+        d1.download_button("下載名單 CSV",
+                           wl.to_csv(index=False).encode("utf-8-sig"),
+                           file_name=f"watchlist_{dt.date.today().isoformat()}.csv",
+                           mime="text/csv", use_container_width=True)
+        if not hist.empty:
+            d2.download_button("下載移出紀錄 CSV",
+                               hist.to_csv(index=False).encode("utf-8-sig"),
+                               file_name=f"watchlist_history_{dt.date.today().isoformat()}.csv",
+                               mime="text/csv", use_container_width=True)
+
+        # ---------------- 教學圖 ----------------
+        st.divider()
+        st.subheader("產生教學圖")
+        st.caption("用的是教學圖 app 同一份 teach_core，圖不會兩邊長不一樣。"
+                   "第一次要載大盤資料算 RS，會慢一點。")
+
+        labels = {f"{r['代號']} {r['名稱']}": r["代號"] for _, r in wl.iterrows()}
+        default = [k for k, v in labels.items()
+                   if wl.loc[wl["代號"] == v, "觸發日"].notna().any()][:5]
+        picked = st.multiselect("選要出圖的股票", list(labels), default=default,
+                                key="t4_pick")
+        cc1, cc2, cc3, cc4 = st.columns(4)
+        weeks = cc1.slider("顯示週數", 26, 156, 52, 2, key="t4_weeks")
+        cap = cc2.number_input("一次最多幾張", 1, 20, 5, 1, key="t4_cap")
+        t4_theme = cc3.selectbox("背景", ["白底", "圖表黑底", "全黑底"],
+                                 key="t4_theme")
+        t4_candle = cc4.selectbox("K 棒", ["紅漲綠跌", "紅漲黑跌"], key="t4_candle")
+
+        if st.button("產生教學圖", type="primary", key="t4_go"):
+            if not picked:
+                st.warning("先選至少一檔。")
+            else:
+                import zipfile
+                import matplotlib.pyplot as plt
+                import teach_core as T
+                T.set_style({"白底": "light", "圖表黑底": "chartdark",
+                             "全黑底": "dark"}[t4_theme], t4_candle, True, 0.30)
+                ids = [labels[p] for p in picked][:int(cap)]
+                names = dict(zip(wl["代號"], wl["名稱"]))
+                idx_mkt, rank_all = T.market_context()
+                prog = st.progress(0.0, text="出圖中…")
+                made = []
+                for i, sid in enumerate(ids, 1):
+                    prog.progress(i / len(ids), text=f"出圖中… {sid}")
+                    try:
+                        daily = T.load_one(sid)
+                        wkk = T.to_weekly(daily)
+                        if len(wkk) < T.MA_WEEKS + T.SLOPE_LAG + 2:
+                            st.caption(f"跳過 {sid}：週線僅 {len(wkk)} 根")
+                            continue
+                        rs, nh = T.rs_line(wkk, idx_mkt)
+                        rr = float(rank_all.get(sid, np.nan)) if len(rank_all) else np.nan
+                        segs = T.smooth_segments(T.stage_series(wkk), 6)
+                        legs, ok = T.vcp_contractions(wkk, 26, 6.0)
+                        dtbl, _ = T.deduct_table(wkk, 5, 5)
+                        mm = T.read_metrics(daily, wkk, dtbl, 12, rr, nh)
+                        bx = T.box_stats(wkk, 12, 20)
+                        vz = T.verdicts(mm, bx, segs[-1][2] if segs else 0, ok, legs)
+                        fig = T.build_figure(sid, names.get(sid, ""), daily, wkk,
+                                             segs, dtbl, mm, bx, vz, legs, ok,
+                                             rs, nh, True, True, weeks, 5)
+                        st.pyplot(fig, use_container_width=True)
+                        buf = io.BytesIO()
+                        fig.savefig(buf, format="png", dpi=140,
+                                    bbox_inches="tight",
+                                    facecolor=fig.get_facecolor())
+                        plt.close(fig)
+                        made.append((f"{sid}_{names.get(sid, '')}.png", buf.getvalue()))
+                    except Exception as e:
+                        st.caption(f"跳過 {sid}：{type(e).__name__} {e}")
+                prog.empty()
+                if made:
+                    zb = io.BytesIO()
+                    with zipfile.ZipFile(zb, "w", zipfile.ZIP_DEFLATED) as z:
+                        for fn, data in made:
+                            z.writestr(fn, data)
+                    st.download_button(
+                        f"下載全部 {len(made)} 張圖 (ZIP)", zb.getvalue(),
+                        file_name=f"charts_{dt.date.today().isoformat()}.zip",
+                        mime="application/zip", type="primary")
+
+        # ---------------- 移出原因統計 ----------------
+        if not hist.empty:
+            st.divider()
+            st.subheader("移出原因統計")
+            vc = hist["移出原因"].value_counts()
+            st.bar_chart(vc)
+            hist["在榜天數"] = pd.to_numeric(hist["在榜天數"], errors="coerce")
+            t = int(hist["觸發日"].notna().sum())
+            st.caption(
+                f"累計移出 {len(hist)} 筆 · 平均在榜 {hist['在榜天數'].mean():.0f} 天 · "
+                f"曾觸發 {t}/{len(hist)} = {t / len(hist):.0%}")
+            st.caption("讀法：逾期佔多數 → 進榜門檻太鬆；突破失敗佔多數 → "
+                       "觸發判定有問題；階段破壞佔多數 → 進場時機太早。")
