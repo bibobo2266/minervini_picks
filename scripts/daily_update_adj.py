@@ -35,6 +35,7 @@ import datetime as dt
 import glob
 import os
 import sys
+import time
 
 import pandas as pd
 import requests
@@ -74,8 +75,33 @@ def roc_to_iso(s: str) -> str:
     return f"{int(s[:3]) + 1911:04d}-{s[3:5]}-{s[5:7]}"
 
 
+
+def _get(url: str, timeout: int = 60, tries: int = 4, **kw):
+    """帶重試的 GET。
+
+    2026-09-02 的失敗就是這樣來的：TPEx 那包 3.9MB 只收到 36 萬 bytes 就斷線
+    （IncompleteRead），整支 workflow 掛掉。交易所的端點偶爾會這樣，
+    不是程式錯，重試一次通常就過。指數退避 3/6/12 秒。
+    """
+    last = None
+    for i in range(tries):
+        try:
+            r = requests.get(url, timeout=timeout, **kw)
+            r.raise_for_status()
+            # 提早讀完整個 body，斷線在這裡就會爆，而不是留給後面的 .json()
+            _ = r.content
+            return r
+        except Exception as e:
+            last = e
+            if i < tries - 1:
+                wait = 3 * (2 ** i)
+                print(f"  第 {i + 1} 次抓取失敗（{type(e).__name__}），{wait}s 後重試")
+                time.sleep(wait)
+    raise last
+
+
 def fetch_twse() -> pd.DataFrame:
-    r = requests.get(TWSE, timeout=60, headers={"accept": "application/json"})
+    r = _get(TWSE, timeout=60, headers={"accept": "application/json"})
     r.raise_for_status()
     df = pd.DataFrame(r.json())
     if df.empty:
@@ -92,7 +118,7 @@ def fetch_twse() -> pd.DataFrame:
 
 
 def fetch_tpex():
-    r = requests.get(TPEX, timeout=60, headers={"accept": "application/json"})
+    r = _get(TPEX, timeout=60, headers={"accept": "application/json"})
     r.raise_for_status()
     df = pd.DataFrame(r.json())
     if df.empty:
