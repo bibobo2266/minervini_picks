@@ -1,0 +1,85 @@
+name: watchlist replay（手動）
+
+# 純手動。這是驗證用的一次性工具——驗名單邏輯與門檻參數，
+# 不排程、不串在 daily 後面。跑一次可能要幾十分鐘到幾小時。
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "起日 YYYY-MM-DD"
+        required: true
+        default: "2026-01-01"
+      end:
+        description: "迄日 YYYY-MM-DD（留空＝今天）"
+        required: false
+        default: ""
+      liq:
+        description: "60日均額門檻（萬元）"
+        required: false
+        default: "5000"
+      min_tt:
+        description: "TT 分門檻"
+        required: false
+        default: "8"
+      commit:
+        description: "把 CSV commit 進 data/replay/"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350        # 回補到 2015 會跑很久，別讓它中途被砍
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 裝套件
+        # 不裝 matplotlib / streamlit：replay 不畫圖也不開 UI
+        run: pip install "pandas<3" "numpy<3" requests pyarrow
+
+      - name: 跑回放
+        run: |
+          set -o pipefail
+          END="${{ inputs.end }}"
+          ARGS="--start ${{ inputs.start }} --liq ${{ inputs.liq }} --min-tt ${{ inputs.min_tt }} --out data/replay"
+          if [ -n "$END" ]; then ARGS="$ARGS --end $END"; fi
+          python scripts/watchlist_replay.py $ARGS 2>&1 | tee replay.log
+
+      - name: 摘要貼到 Actions 頁面
+        if: always()
+        run: |
+          echo "## watchlist replay ${{ inputs.start }} → ${{ inputs.end }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          # 只取 ==== 之後的統計段，前面逐日進度沒必要看
+          awk '/^={10,}/{p=1} p' replay.log | head -200 >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: 收起完整 log 與 CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: replay-${{ inputs.start }}
+          path: |
+            replay.log
+            data/replay/*.csv
+          if-no-files-found: warn
+
+      - name: commit CSV
+        if: ${{ inputs.commit }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f data/replay/ || true
+          git diff --cached --quiet && echo "沒有變更" && exit 0
+          git commit -m "replay ${{ inputs.start }}→${{ inputs.end }}"
+          git push
