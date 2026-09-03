@@ -51,7 +51,16 @@ from report_minervini import scan_today         # noqa: E402
 from watchlist_update import COLS, empty_wl, step   # noqa: E402
 
 OUT = "out"
-FWD = (20, 60)          # 進榜／觸發後幾個交易日回頭看報酬
+FWD = (20, 60, 120, 180)   # 進榜／觸發後幾個交易日回頭看報酬。
+                           # 加長天期是要看跳空成本能不能被時間攤薄：
+                           # 固定的 1.3% 進場劣勢，在 20 日週期是致命的，
+                           # 在 180 日週期只要趨勢還在就相對可忽略。
+
+# 限價回檔進場的模擬網格。台股委託單當日有效，超過一天要靠券商條件單
+# （長效單），凱基/元富 90 天、第一金 30 天，組數上限 50-300 不等。
+LIMIT_BUFFERS = (0.010, 0.005, 0.000, -0.010, -0.020)   # 掛單價 = 樞紐價 ×(1+buf)
+LIMIT_WAITS = (5, 10, 20)                                # 條件單監控幾個交易日
+LIMIT_HOLD = 60                                          # 成交後持有幾個交易日
 
 
 def replay(start, end, liq, min_tt, years, progress=20,
@@ -106,6 +115,7 @@ def replay(start, end, liq, min_tt, years, progress=20,
                 events.append(dict(日期=day, 代號=a["代號"], 名稱=a["名稱"],
                                    產業=a["產業"], 事件="觸發", 原因="進榜即觸發",
                                    收盤=a["進榜價"], RS=a["進榜RS"],
+                                   樞紐=a["進榜樞紐"],
                                    底部序=a["進榜底部序"], 在榜天數=0))
         for p in promoted:
             sid = p.split()[0]
@@ -120,6 +130,7 @@ def replay(start, end, liq, min_tt, years, progress=20,
                                事件="觸發", 原因="等待後觸發",
                                收盤=g["最新價"] if g is not None else np.nan,
                                RS=g["最新RS"] if g is not None else np.nan,
+                               樞紐=g["進榜樞紐"] if g is not None else np.nan,
                                底部序=g["進榜底部序"] if g is not None else np.nan,
                                在榜天數=g["在榜天數"] if g is not None else np.nan))
         for r in removed:
@@ -372,6 +383,143 @@ def report(ev, dn, wl_end):
     return monthly, ind, stock
 
 
+def limit_entry_grid(ev, m, hold=LIMIT_HOLD):
+    """模擬「不追突破、掛限價等回檔」的進場方式。
+
+    現實對應：訊號在 T 日收盤產生，你在券商 App 設一張條件單——
+      監控條件：成交價 <= 樞紐價 x (1+buf)
+      委託內容：限價買進、同價、ROD
+      監控天數：wait 個交易日
+    台股委託單當日有效，超過一天必須用券商端的條件單（長效單），
+    而且要預掛在券商主機、不是預掛在手機，否則 App 關掉就失效。
+
+    成交價的處理：條件觸發後送出的是委託單不是成交單。當日最低價
+    <= 掛單價才算成交；若當日開盤已經低於掛單價，成交價用開盤價
+    （對買方更有利，這是真實會發生的）。
+
+    這個函式要回答的是一個乘積：**成交率 x 成交後的超額**。
+    回檔進場最經典的失敗模式是——省下了跳空成本，但漲最兇的股票
+    從來不回頭，你等到的全是突破無力的那批。成交率高不代表好。
+    """
+    trg = ev[ev["事件"] == "觸發"].dropna(subset=["樞紐"]).copy()
+    if trg.empty or "l" not in m:
+        return pd.DataFrame()
+
+    c, o, l = m["c"], m["o"], m["l"]
+    dates = c.index
+    dpos = {d: i for i, d in enumerate(dates)}
+    cols = {s_: j for j, s_ in enumerate(c.columns)}
+    C, O, L = c.to_numpy(), o.to_numpy(), l.to_numpy()
+
+    # 基準：從成交日起算、同持有期的全市場橫斷面中位數
+    fwd = c.shift(-hold) / c - 1
+    BENCH = fwd.median(axis=1).to_numpy()
+
+    rows = []
+    for buf in LIMIT_BUFFERS:
+        for wait in LIMIT_WAITS:
+            n_cand = n_fill = 0
+            rets, exs, waits_used, discs = [], [], [], []
+            for _, e in trg.iterrows():
+                d, sid, piv = pd.Timestamp(e["日期"]), e["代號"], float(e["樞紐"])
+                if sid not in cols or d not in dpos or not np.isfinite(piv):
+                    continue
+                i0, j = dpos[d], cols[sid]
+                n_cand += 1
+                limit = piv * (1 + buf)
+                fill_i = None
+                for k in range(1, wait + 1):          # 隔日起算
+                    i = i0 + k
+                    if i >= len(dates):
+                        break
+                    if np.isfinite(L[i, j]) and L[i, j] <= limit:
+                        fill_i = i
+                        break
+                if fill_i is None:
+                    continue
+                op = O[fill_i, j]
+                px = min(limit, op) if np.isfinite(op) else limit
+                iend = fill_i + hold
+                if iend >= len(dates) or not np.isfinite(C[iend, j]) or px <= 0:
+                    continue
+                n_fill += 1
+                r = C[iend, j] / px - 1
+                rets.append(r * 100)
+                exs.append((r - BENCH[fill_i]) * 100)
+                waits_used.append(fill_i - i0)
+                discs.append((px / float(e["收盤"]) - 1) * 100)
+            if not rets:
+                continue
+            fill_rate = n_fill / n_cand if n_cand else 0
+            med_ex = float(np.median(exs))
+            rows.append({
+                "掛單價": f"樞紐{buf:+.1%}".replace("+0.0%", "±0%"),
+                "監控日": wait, "候選": n_cand, "成交": n_fill,
+                "成交率%": round(fill_rate * 100, 1),
+                "折價%": round(float(np.median(discs)), 2),
+                "等待日": int(np.median(waits_used)),
+                f"報酬{hold}D": round(float(np.median(rets)), 1),
+                "超額": round(med_ex, 1),
+                "勝率%": round(float((np.array(exs) > 0).mean() * 100), 1),
+                "期望值": round(fill_rate * med_ex, 2),
+            })
+    # 基準列：T+1 開盤進場、100% 成交。沒有這一列就會犯下最常見的錯誤——
+    # 看到限價的單筆超額比較高就以為贏了，卻忘記它有四成根本沒買到。
+    base_r, base_x = [], []
+    for _, e in trg.iterrows():
+        d, sid = pd.Timestamp(e["日期"]), e["代號"]
+        if sid not in cols or d not in dpos:
+            continue
+        i0, j = dpos[d], cols[sid]
+        i1, iend = i0 + 1, i0 + 1 + hold
+        if iend >= len(dates):
+            continue
+        px = O[i1, j]
+        if not np.isfinite(px) or px <= 0 or not np.isfinite(C[iend, j]):
+            continue
+        r = C[iend, j] / px - 1
+        base_r.append(r * 100)
+        base_x.append((r - BENCH[i1]) * 100)
+    if base_r:
+        bx = float(np.median(base_x))
+        rows.insert(0, {
+            "掛單價": "◆T+1開盤", "監控日": 0, "候選": len(base_r),
+            "成交": len(base_r), "成交率%": 100.0,
+            "折價%": round(float(trg["跳空%"].median()), 2)
+            if "跳空%" in trg.columns else np.nan,
+            "等待日": 1, f"報酬{hold}D": round(float(np.median(base_r)), 1),
+            "超額": round(bx, 1),
+            "勝率%": round(float((np.array(base_x) > 0).mean() * 100), 1),
+            "期望值": round(bx, 2),
+        })
+
+    g = pd.DataFrame(rows)
+    if g.empty:
+        return g
+
+    print(f"\n── 限價回檔進場網格（持有 {hold}D，基準為同期全市場中位）──")
+    print(g.to_string(index=False))
+    print("  折價% = 成交價相對觸發日收盤，負值代表買得比收盤便宜。")
+    print("  期望值 = 成交率 x 中位超額。這是唯一該看的欄位——成交率高但"
+          "超額為負，或超額漂亮但只成交兩成，都不能做。")
+    best = g.loc[g["期望值"].idxmax()]
+    print(f"  最佳格：{best['掛單價']} / 監控 {best['監控日']} 日　"
+          f"成交率 {best['成交率%']}%　超額 {best['超額']}　"
+          f"期望值 {best['期望值']}")
+    if "◆T+1開盤" in set(g["掛單價"]):
+        b0 = g[g["掛單價"] == "◆T+1開盤"]["期望值"].iloc[0]
+        if best["掛單價"] == "◆T+1開盤":
+            print("  → 限價回檔全部輸給直接開盤進場。省下的跳空成本"
+                  "補不回錯過的那批單。")
+        else:
+            print(f"  → 限價最佳 {best['期望值']} vs 開盤進場 {b0}，"
+                  f"差 {best['期望值'] - b0:+.2f}。差距小於 1 就不值得為它"
+                  "多維護一套條件單。")
+    if g["期望值"].max() <= 0:
+        print("  ⚠ 所有格子的期望值都 <= 0。問題不在進場方式，在訊號本身。")
+    return g
+
+
 def yearly_stability(ev):
     """逐年攤開三個候選濾網，回傳矩陣 DataFrame 並列印。
 
@@ -461,6 +609,7 @@ def main():
         ev = add_forward_returns(ev, m["c"], m.get("o"))
     monthly, ind, stock = report(ev, dn, wl_end)
     yearly = yearly_stability(ev) if not ev.empty else pd.DataFrame()
+    grid = limit_entry_grid(ev, m) if not ev.empty else pd.DataFrame()
 
     os.makedirs(args.out, exist_ok=True)
     written = []
@@ -468,7 +617,8 @@ def main():
                           ("replay_monthly.csv", monthly, True),
                           ("replay_industry.csv", ind, True),
                           ("replay_stocks.csv", stock, False),
-                          ("replay_yearly.csv", yearly, True)]:
+                          ("replay_yearly.csv", yearly, True),
+                          ("replay_limitgrid.csv", grid, False)]:
         if df is None or not len(df):
             continue
         p = os.path.join(args.out, name)

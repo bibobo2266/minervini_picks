@@ -27,7 +27,8 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from watchlist_replay import gap_and_filters, yearly_stability  # noqa: E402
+from watchlist_replay import (gap_and_filters, limit_entry_grid,  # noqa: E402
+                              yearly_stability)
 
 
 def load_all(indir: str) -> pd.DataFrame:
@@ -104,6 +105,20 @@ def main():
                   "系統性高估。確認 `data/adj` 的 parquet 有 `open` 欄位、"
                   "且 `minervini_core.build_matrices` 有讀進來。", ""]
 
+    grid_txt = ""
+    gpath = os.path.join(args.indir, "grid_all.csv")
+    grids = [pd.read_csv(f) for f in
+             sorted(glob.glob(os.path.join(args.indir, "*", "replay_limitgrid.csv")))]
+    if grids:
+        allg = pd.concat(grids, ignore_index=True)
+        agg = (allg.groupby(["掛單價", "監控日"])
+               .agg(年數=("超額", "size"), 為負年數=("超額", lambda x: int((x < 0).sum())),
+                    中位成交率=("成交率%", "median"), 中位超額=("超額", "median"),
+                    中位期望值=("期望值", "median"))
+               .reset_index().sort_values("中位期望值", ascending=False))
+        agg.to_csv(gpath, index=False, encoding="utf-8-sig")
+        grid_txt = md_table(agg, index_name="")
+
     lines += ["## 逐年矩陣", "", md_table(yr), "",
               "**微結構斷點**：逐筆交易 2020-03-23 上路（取代五秒一次集合競價）、"
               "當沖降稅 2017-04 起、盤中零股 2020-10。這些直接改變開盤價的形成"
@@ -111,6 +126,11 @@ def main():
               "**2020 之前與之後不是同質樣本，跨越這條線做平均沒有意義。**", "",
               "看的是**符號一致性**不是幅度。某個分組 11 年裡有 8 年為負，"
               "那是規則；只有 1 年為負，那是雜訊。", "",
+              "## 限價回檔進場：各格逐年匯總", "",
+              (grid_txt or "_各年沒有 replay_limitgrid.csv_\n"), "",
+              "`◆T+1開盤` 是基準列（100% 成交）。只看**中位期望值**——"
+              "限價的單筆超額通常較高，但成交率只有五到六成，"
+              "把沒買到的那批算進去才是真實績效。", "",
               "## 判定與跳空成本", "", "```", yr_txt.strip(), "", gf_txt.strip(),
               "```", "",
               "## 怎麼用這份報告", "",
