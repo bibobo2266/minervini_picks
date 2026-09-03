@@ -29,8 +29,13 @@ import datetime as dt
 import os
 import sys
 
+import warnings
+
 import numpy as np
 import pandas as pd
+
+# minervini_core 對資料不足的股票會做空切片平均，噪音蓋掉真正的訊息
+warnings.filterwarnings("ignore", message="Mean of empty slice")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -77,6 +82,13 @@ def replay(start, end, liq, min_tt, years, progress=20):
                                產業=a["產業"], 事件="進榜", 原因=a["進榜狀態"],
                                收盤=a["進榜價"], RS=a["進榜RS"],
                                底部序=a["進榜底部序"], 在榜天數=0))
+            if a["進榜狀態"] == "觸發":
+                # 進榜當下就已突破的，也是一次觸發。不補這筆的話
+                # 觸發率會漏算——例如 2026-09-02 那批 17 檔有 3 檔是這種。
+                events.append(dict(日期=day, 代號=a["代號"], 名稱=a["名稱"],
+                                   產業=a["產業"], 事件="觸發", 原因="進榜即觸發",
+                                   收盤=a["進榜價"], RS=a["進榜RS"],
+                                   底部序=a["進榜底部序"], 在榜天數=0))
         for p in promoted:
             sid = p.split()[0]
             r = new_wl[new_wl["代號"] == sid]
@@ -175,7 +187,11 @@ def report(ev, dn, wl_end):
         cells = []
         for n in FWD:
             r, b = g[f"報酬{n}D"].median(), g[f"基準{n}D"].median()
-            cells.append(f"{n}D {r:+.1f}（{b:+.1f}）")
+            k = g[f"報酬{n}D"].notna().sum()
+            if pd.isna(r):
+                cells.append(f"{n}D 無（未來 {n} 日資料還沒發生）")
+            else:
+                cells.append(f"{n}D {r:+.1f}（{b:+.1f}）n={k}")
         print(f"  {label}　" + "　".join(cells))
     print("提醒：這段數字只說明名單方向，不是策略績效——沒有部位管理與停損，"
           "且區間內市場環境單一。")
