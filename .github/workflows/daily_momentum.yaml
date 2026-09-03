@@ -1,0 +1,109 @@
+# 精髓版動能：每日訊號
+#
+# 一條規則：創 250 日新高 -> 隔日開盤買 -> -8% 停損 -> 抱到出場。
+# 產出 SIGNALS.md（手機直接讀）與 data/simple_positions.csv（paper trade 狀態）。
+#
+# 排程 16:00 台北時間（08:00 UTC），台股 13:30 收盤後兩個半小時，
+# 留給資料源更新的緩衝。手動觸發隨時可用。
+#
+# ⚠️ 第一次正式上線前，先手動刪掉 data/simple_positions.csv。
+#    否則會把測試期間的模擬部位當成你的真實部位。
+
+name: 每日動能訊號
+
+on:
+  schedule:
+    - cron: '0 8 * * 1-5'      # 週一到週五 08:00 UTC = 16:00 台北
+  workflow_dispatch:
+    inputs:
+      max_new:
+        description: '每天最多收幾筆新訊號（隨機取樣，0 = 全收）。全市場一天 2-20 檔新高，建議 1-2'
+        required: true
+        default: '2'
+      update_data:
+        description: '是否先更新價格資料（需要 FINMIND_TOKEN）'
+        required: true
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+
+permissions:
+  contents: write
+
+concurrency:                   # 排程與手動同時觸發時，不要兩個 job 一起寫檔
+  group: daily-momentum
+  cancel-in-progress: false
+
+jobs:
+  signals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安裝套件
+        run: |
+          python -m pip install -U pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pandas numpy pyarrow requests
+
+      - name: 更新價格資料
+        if: ${{ github.event_name == 'schedule' || inputs.update_data == 'true' }}
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+        run: |
+          if [ -z "$FINMIND_TOKEN" ]; then
+            echo "::warning::沒有 FINMIND_TOKEN，略過資料更新，將用 repo 現有的 parquet"
+            exit 0
+          fi
+          python scripts/daily_update_adj.py || \
+            echo "::warning::資料更新失敗，改用現有 parquet 繼續"
+
+      - name: 檢查資料新鮮度
+        run: |
+          python - <<'PY'
+          import glob, sys, datetime as dt
+          import pandas as pd
+          fs = sorted(glob.glob("data/adj/prices_adj_*.parquet"))
+          if not fs:
+              print("::error::data/adj 底下沒有 parquet"); sys.exit(1)
+          last = pd.read_parquet(fs[-1])["date"].max()
+          last = pd.Timestamp(last).date()
+          gap = (dt.date.today() - last).days
+          print(f"資料最新日 {last}，距今 {gap} 天")
+          # 連假最長約 6 天（農曆年），超過就是真的沒更新到
+          if gap > 6:
+              print(f"::error::資料已經 {gap} 天沒更新，訊號會是舊的。"
+                    "檢查 FINMIND_TOKEN 與 daily_update_adj.py")
+              sys.exit(1)
+          if gap > 3:
+              print(f"::warning::資料 {gap} 天沒更新，可能是連假，也可能是更新失敗")
+          PY
+
+      - name: 產生訊號
+        run: |
+          python scripts/simple_momentum.py \
+            --max-new ${{ github.event_name == 'schedule' && '2' || inputs.max_new }}
+
+      - name: 存檔備份
+        run: |
+          # 每天留一份當日快照。狀態檔一旦寫壞，可以從這裡救回來。
+          mkdir -p out/signals
+          cp SIGNALS.md "out/signals/$(date -u +%Y-%m-%d).md"
+
+      - name: Commit
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add SIGNALS.md data/simple_positions.csv out/signals
+          git diff --cached --quiet && { echo "沒有變更"; exit 0; }
+          git commit -m "signals: $(date -u +%Y-%m-%d)"
+          git pull --rebase --autostash
+          git push
