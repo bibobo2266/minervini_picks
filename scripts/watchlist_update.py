@@ -105,44 +105,13 @@ def check_exit(row, cur, today: dt.date):
     return False, ""
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--liq", type=float, default=5000)
-    ap.add_argument("--min-tt", type=int, default=8)
-    ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--stats", action="store_true")
-    args = ap.parse_args()
+def step(wl, hist, scan, today, verbose=True):
+    """一天的名單推進。回傳 (新名單, 移出, 新增, 升級為觸發)。
 
-    if args.stats:
-        h = load_history()
-        if h.empty:
-            print("還沒有移出紀錄")
-            return
-        print(f"累計移出 {len(h)} 筆\n")
-        print("移出原因分佈：")
-        print(h["移出原因"].value_counts().to_string())
-        h["在榜天數"] = pd.to_numeric(h["在榜天數"], errors="coerce")
-        print(f"\n平均在榜 {h['在榜天數'].mean():.0f} 天"
-              f"（中位數 {h['在榜天數'].median():.0f}）")
-        trig = h["觸發日"].notna().sum()
-        print(f"曾經觸發 {trig} 檔 / {len(h)} 檔 = {trig / len(h):.0%}")
-        print("\n讀法：逾期佔多數 → 進榜門檻太鬆；突破失敗佔多數 → 觸發判定有問題；"
-              "階段破壞佔多數 → 進場時機太早。")
-        return
-
-    today = dt.date.today()
-    os.makedirs("data", exist_ok=True)
-
-    scan = scan_today(args.liq, args.min_tt)
-    if scan.empty:
-        print("掃描結果為空，不更新")
-        return
+    抽出來讓 watchlist_replay.py 逐日重放時呼叫同一份邏輯——回測與實跑
+    共用一份判定，不然兩邊會慢慢分岔。
+    """
     scan_idx = scan.set_index("代號")
-    print(f"今日掃描 {len(scan)} 檔："
-          + "、".join(f"{k} {v}" for k, v in scan["狀態"].value_counts().items()))
-
-    wl = load_wl()
-    hist = load_history()
     kept, removed, promoted = [], [], []
 
     # ---- 1. 對在榜的逐檔檢查 ----
@@ -189,14 +158,16 @@ def main():
         if sid in kept_ids or sid in removed_today:
             continue
         if sid in cool and (today - cool[sid]).days < COOLDOWN_DAYS * 7 / 5:
-            print(f"  冷卻中，不收：{sid} {c['名稱']}")
+            if verbose:
+                print(f"  冷卻中，不收：{sid} {c['名稱']}")
             continue
         probe = {"進榜日": today.isoformat(), "進榜樞紐": c["樞紐價"],
                  "觸發日": today.isoformat() if c["狀態"] == "觸發" else np.nan,
                  "名稱": c["名稱"]}
         bad, why = check_exit(pd.Series(probe), c, today)
         if bad:
-            print(f"  不符進榜條件（{why}）：{sid} {c['名稱']}")
+            if verbose:
+                print(f"  不符進榜條件（{why}）：{sid} {c['名稱']}")
             continue
         piv = c["樞紐價"]
         # 停損：樞紐下方 8%，沒有樞紐就用 30 週線
@@ -217,9 +188,50 @@ def main():
         else empty_wl()
     new_wl = new_wl.sort_values(
         ["目前狀態", "在榜天數"], ascending=[True, False]).reset_index(drop=True)
+    return new_wl, removed, added, promoted
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--liq", type=float, default=5000)
+    ap.add_argument("--min-tt", type=int, default=8)
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--stats", action="store_true")
+    args = ap.parse_args()
+
+    if args.stats:
+        h = load_history()
+        if h.empty:
+            print("還沒有移出紀錄")
+            return
+        print(f"累計移出 {len(h)} 筆\n")
+        print("移出原因分佈：")
+        print(h["移出原因"].value_counts().to_string())
+        h["在榜天數"] = pd.to_numeric(h["在榜天數"], errors="coerce")
+        print(f"\n平均在榜 {h['在榜天數'].mean():.0f} 天"
+              f"（中位數 {h['在榜天數'].median():.0f}）")
+        trig = h["觸發日"].notna().sum()
+        print(f"曾經觸發 {trig} 檔 / {len(h)} 檔 = {trig / len(h):.0%}")
+        print("\n讀法：逾期佔多數 → 進榜門檻太鬆；突破失敗佔多數 → 觸發判定有問題；"
+              "階段破壞佔多數 → 進場時機太早。")
+        return
+
+    today = dt.date.today()
+    os.makedirs("data", exist_ok=True)
+
+    scan = scan_today(args.liq, args.min_tt)
+    if scan.empty:
+        print("掃描結果為空，不更新")
+        return
+    print(f"今日掃描 {len(scan)} 檔："
+          + "、".join(f"{k} {v}" for k, v in scan["狀態"].value_counts().items()))
+
+    wl = load_wl()
+    hist = load_history()
+    new_wl, removed, added, promoted = step(wl, hist, scan, today)
 
     # ---- 4. 報告 ----
-    print(f"\n在榜 {len(new_wl)} 檔（保留 {len(kept)}、新增 {len(added)}）")
+    print(f"\n在榜 {len(new_wl)} 檔（保留 {len(new_wl) - len(added)}、新增 {len(added)}）")
     if added:
         print("新進榜：" + "、".join(f"{a['代號']} {a['名稱']}" for a in added))
     if promoted:

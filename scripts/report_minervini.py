@@ -73,12 +73,17 @@ def build_charts(ids: list, names: dict, outdir: str, weeks: int = 52) -> list:
     return made
 
 
-def scan_today(liq: float = 5000, min_tt: int = 8) -> pd.DataFrame:
+def scan_today(liq: float = 5000, min_tt: int = 8, m=None, uni=None) -> pd.DataFrame:
     """跑一次完整掃描，回傳非淘汰名單（含狀態）。
     抽出來讓 watchlist_update.py 共用——名單判定和報表必須看同一份數字，
-    不然會出現「報表說觸發、追蹤表說沒有」。"""
-    m, _ = M.build_matrices()
-    uni = M.load_universe()
+    不然會出現「報表說觸發、追蹤表說沒有」。
+
+    m / uni 是給 watchlist_replay.py 用的：回放時餵進已切到某一天的矩陣，
+    這裡就會照那天的資料判定。不給就跟原本一樣抓最新。"""
+    if m is None:
+        m, _ = M.build_matrices()
+    if uni is None:
+        uni = M.load_universe()
     base = M.scan(m, liq)
     if base.empty:
         return pd.DataFrame()
