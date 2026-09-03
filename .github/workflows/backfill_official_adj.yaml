@@ -1,0 +1,162 @@
+# 官方還原股價：驗證 + 全歷史回補
+#
+# ⚠️ 時效性：TaiwanStockPriceAdj 需要 Backer 以上訂閱。訂閱到期後就抓不到，
+#    而已經下載存進 repo 的 parquet 是你的、不會消失。
+#    **在訂閱有效期內把 2015-06 到今天的全歷史抓完，這是一次性的機會。**
+#
+# 兩個 job：
+#   verify   兩分鐘。確認 TaiwanStockPriceAdj 真的有還原（不是把未還原資料回你）
+#   backfill 逐日抓，可續跑。跑不完再跑一次，_done_dates.txt 會記得跑到哪
+#
+# backfill 每次跑有 --limit 上限，避免撞到 Actions 六小時。跑到全部完成為止，
+# 每次結束都會 commit，中斷了也不會白跑。
+
+name: 官方還原股價回補
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '要做什麼'
+        required: true
+        default: 'verify'
+        type: choice
+        options: ['verify', 'backfill', 'verify+backfill']
+      start:
+        description: '回補起始日（2015-06-01 = 漲跌幅放寬到 10% 的起點）'
+        required: true
+        default: '2015-06-01'
+      limit:
+        description: '本次最多抓幾個交易日（0 = 不限，但小心六小時上限）。SLEEP=2.3 秒，1500 天約 1 小時'
+        required: true
+        default: '1500'
+      wipe:
+        description: '砍掉現有 parquet 重來？現有檔是自算因子版、有 107 筆未還原公司行動。第一次跑選 true'
+        required: true
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: adj-backfill
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安裝套件
+        run: |
+          python -m pip install -U pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pandas numpy pyarrow requests
+
+      - name: 檢查 token
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+        run: |
+          if [ -z "$FINMIND_TOKEN" ]; then
+            echo "::error::沒有設定 FINMIND_TOKEN secret"; exit 1
+          fi
+
+      - name: 驗證還原
+        if: contains(inputs.mode, 'verify')
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+        run: python scripts/verify_adj.py
+
+      - name: 清掉自算因子版的舊檔
+        if: ${{ inputs.wipe == 'true' && contains(inputs.mode, 'backfill') }}
+        run: |
+          # 舊 parquet 是 build_adj.py 用自算因子產的，漏掉減資與分割。
+          # 跟官方版混在一起會出現「有些日期還原了、有些沒有」的花資料，
+          # 比全錯更難debug。要換就整批換。
+          echo "刪除前："; ls -la data/adj | head -20
+          rm -f data/adj/prices_adj_*.parquet data/adj/_done_dates.txt
+          echo "已清空 data/adj 的價格檔（除權息表保留）"
+
+      - name: 回補
+        if: contains(inputs.mode, 'backfill')
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+        run: |
+          python scripts/backfill_adj.py \
+            --start ${{ inputs.start }} \
+            --limit ${{ inputs.limit }}
+
+      - name: 抓完了沒
+        if: contains(inputs.mode, 'backfill')
+        run: |
+          python - <<'PY'
+          import os, glob
+          import pandas as pd
+          done = set()
+          p = "data/adj/_done_dates.txt"
+          if os.path.exists(p):
+              done = {l.strip() for l in open(p, encoding="utf-8") if l.strip()}
+          fs = sorted(glob.glob("data/adj/prices_adj_*.parquet"))
+          print(f"已完成 {len(done)} 個交易日，{len(fs)} 個年份檔")
+          if fs:
+              d = pd.read_parquet(fs[-1])
+              print(f"最新檔 {os.path.basename(fs[-1])}："
+                    f"{d['date'].min()} ~ {d['date'].max()}，"
+                    f"{d['stock_id'].nunique()} 檔")
+          # 2015-06 到今天約 2,700 個交易日
+          if len(done) < 2600:
+              print(f"::warning::還沒抓完（{len(done)}/約2700 天）。"
+                    "再跑一次這個 workflow（mode=backfill、wipe=false）續抓")
+          else:
+              print("::notice::全歷史抓完了。接著跑一次分年回測驗證數字有沒有改善")
+          PY
+
+      - name: 稽核未還原的公司行動
+        if: contains(inputs.mode, 'backfill')
+        run: |
+          python - <<'PY'
+          import glob
+          import pandas as pd
+          fs = sorted(glob.glob("data/adj/prices_adj_*.parquet"))
+          if not fs:
+              raise SystemExit(0)
+          d = pd.concat([pd.read_parquet(f) for f in fs], ignore_index=True)
+          d = d[d.stock_id.astype(str).str.match(r"^[1-9]\d{3}$")]
+          d["date"] = pd.to_datetime(d["date"])
+          d = d.sort_values(["stock_id", "date"])
+          d["prev"] = d.groupby("stock_id")["close"].shift()
+          chg = d["close"] / d["prev"] - 1
+          # 台股單日跌幅上限 10%。跌超過 11% 只有兩種可能：
+          # 興櫃（無漲跌幅限制），或未還原的公司行動。
+          bad = d[(chg < -0.11) & d["prev"].notna() & (d["close"] > 0)]
+          print(f"單日跌逾 11% 的筆數：{len(bad)}（涉及 {bad.stock_id.nunique()} 檔）")
+          big = d[(chg < -0.30) & d["prev"].notna() & (d["close"] > 0)]
+          print(f"其中跌逾 30%（幾乎確定是未還原公司行動）：{len(big)}")
+          if len(big):
+              print(big.tail(15)[["date", "stock_id", "prev", "close"]]
+                    .to_string(index=False))
+              print("::warning::仍有未還原的公司行動，官方還原也不是全對")
+          else:
+              print("::notice::沒有跌逾 30% 的異常，還原品質良好")
+          PY
+
+      - name: Commit
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A data/adj VERIFY.md 2>/dev/null || true
+          git diff --cached --quiet && { echo "沒有變更"; exit 0; }
+          git commit -m "adj: 官方還原股價回補（${{ inputs.mode }}）"
+          git pull --rebase --autostash
+          git push
