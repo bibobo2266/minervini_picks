@@ -1,0 +1,160 @@
+# 分年回測（手動觸發）
+#
+# 為什麼是矩陣而不是一個 job 跑完七年：
+#   1. Actions 單一 job 六小時上限。逐日推進 × 七年可能撞到。
+#   2. 一個 job 跑完七年，第六年掛掉就整段重來。分年跑，掛掉的只重跑那年。
+#   3. 平行跑，牆鐘時間約等於最慢的那一年。
+#
+# 為什麼不各自 commit：七個 job 同時 push 同一個 branch 會互相打架。
+# 各自產 artifact，最後由 merge job 一次 commit。
+#
+# 手機操作：github.com → Actions → 這個 workflow → Run workflow
+# （GitHub 手機 App 對 workflow 輸入欄支援不好，用瀏覽器開，
+#   必要時切「桌面版網站」）
+# 跑完在 repo 根目錄讀 REPLAY.md。
+
+name: 分年回測 replay
+
+on:
+  workflow_dispatch:
+    inputs:
+      years:
+        description: '年份，逗號分隔。實測一年約 150 秒，全部跑完也不到十分鐘'
+        required: true
+        default: '2015,2016,2017,2018,2019,2020,2021,2022,2023,2024,2025,2026'
+      liq_pct:
+        description: '流動性門檻百分位（25 = 成交值前 25%）。全部年份必須用同一個數字'
+        required: true
+        default: '25'
+      min_tt:
+        description: 'TT 分下限'
+        required: true
+        default: '8'
+      warmup_months:
+        description: '暖身月數，事件不列入報表。分年跑必設 3'
+        required: true
+        default: '3'
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+    steps:
+      - id: mk
+        run: |
+          Y='${{ github.event.inputs.years }}'
+          M=$(python3 -c "import json,sys;print(json.dumps([y.strip() for y in '$Y'.split(',') if y.strip()]))")
+          echo "matrix=$M" >> $GITHUB_OUTPUT
+          echo "將回測：$M"
+
+  replay:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 60         # 實測一年約 150 秒；設 60 分是為了卡住無窮迴圈，
+                                # 不是預期會跑那麼久。超過就是出事了
+    strategy:
+      fail-fast: false          # 某一年掛掉不該讓其他年一起死
+      max-parallel: 6           # 每個 job 兩分半，六個併發足夠，也不會把
+                                # 免費帳號的併發額度吃光
+      matrix:
+        year: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true             # data/adj 若用 LFS 存，沒這行會拿到指標檔
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安裝套件
+        run: |
+          python -m pip install -U pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pandas numpy pyarrow requests
+
+      - name: 確認 parquet 有 open 欄位
+        run: |
+          python - <<'PY'
+          import glob, sys, pandas as pd
+          fs = sorted(glob.glob("data/adj/prices_adj_*.parquet"))
+          if not fs:
+              print("::warning::data/adj 底下沒有 parquet，將改從 raw.githubusercontent 下載")
+              sys.exit(0)
+          cols = pd.read_parquet(fs[-1]).columns.tolist()
+          print(fs[-1], cols)
+          if "open" not in cols:
+              print("::error::parquet 沒有 open 欄位，T+1 開盤報酬算不出來。"
+                    "先改 scripts/build_adj.py 把 open 存進去")
+              sys.exit(1)
+          PY
+
+      - name: 回測 ${{ matrix.year }}
+        run: |
+          python scripts/watchlist_replay.py \
+            --start ${{ matrix.year }}-01-01 \
+            --end   ${{ matrix.year }}-12-31 \
+            --liq-pct ${{ github.event.inputs.liq_pct }} \
+            --min-tt ${{ github.event.inputs.min_tt }} \
+            --warmup-months ${{ github.event.inputs.warmup_months }} \
+            --out out/replay/${{ matrix.year }} \
+            2>&1 | tee out_${{ matrix.year }}.log
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: replay-${{ matrix.year }}
+          path: |
+            out/replay/${{ matrix.year }}
+            out_${{ matrix.year }}.log
+          retention-days: 14
+
+  merge:
+    needs: replay
+    if: always()                # 有年份失敗時，仍然合併成功的那些
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - run: |
+          python -m pip install -U pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pandas numpy pyarrow requests
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: replay-*
+          path: dl
+
+      - name: 攤平 artifact 目錄
+        run: |
+          mkdir -p out/replay
+          # download-artifact 會多包一層 replay-YYYY/，把年份目錄搬到定位
+          find dl -name replay_events.csv | while read f; do
+            y=$(basename "$(dirname "$f")")
+            mkdir -p "out/replay/$y" && cp "$(dirname "$f")"/* "out/replay/$y/"
+          done
+          ls -R out/replay | head -50
+
+      - name: 合併並產出報告
+        run: |
+          python scripts/replay_merge.py \
+            --in out/replay --out REPLAY.md \
+            --params "liq_pct=${{ github.event.inputs.liq_pct }} min_tt=${{ github.event.inputs.min_tt }} warmup=${{ github.event.inputs.warmup_months }} years=${{ github.event.inputs.years }}"
+
+      - name: Commit 回 repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add REPLAY.md out/replay
+          git diff --cached --quiet && { echo "沒有變更"; exit 0; }
+          git commit -m "replay: 分年回測 ${{ github.event.inputs.years }} (liq_pct=${{ github.event.inputs.liq_pct }})"
+          git pull --rebase --autostash
+          git push
