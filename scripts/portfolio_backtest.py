@@ -62,7 +62,7 @@ COST = 0.006               # 來回 0.60%（手續費 + 交易稅）
 UNIVERSE_PCT = 0.25        # 母體：當日成交值前 25%
 
 
-def build_matrices():
+def build_matrices(market="all"):
     fs = sorted(glob.glob(os.path.join(DATA_DIR, "prices_adj_*.parquet")))
     if not fs:
         raise SystemExit(f"{DATA_DIR} 底下沒有 prices_adj_*.parquet")
@@ -71,7 +71,9 @@ def build_matrices():
 
     import minervini_core as M
     uni = M.load_universe()
-    listed = set(uni[uni["type"].isin(["twse", "tpex"])].index.astype(str))
+    types = ["twse", "tpex"] if market == "all" else [market]
+    listed = set(uni[uni["type"].isin(types)].index.astype(str))
+    print(f"  市場別 {market}：{len(listed)} 檔")
     d = d[d["stock_id"].astype(str).str.match(r"^[1-9]\d{3}$")]
     d = d[d["stock_id"].isin(listed) & (d["close"] > 0)]
 
@@ -246,13 +248,15 @@ def main():
     ap.add_argument("--capital", type=float, default=1_000_000)
     ap.add_argument("--stop", type=float, default=12.0, help="停損 %%")
     ap.add_argument("--seeds", type=int, default=10)
+    ap.add_argument("--market", default="all", choices=["all", "twse", "tpex"],
+                    help="⚠️ universe 的 type 是現值，轉板股會被回貼成現在的市場別")
     ap.add_argument("--maxprice", type=float, default=0.0,
                     help="股價上限（元），0 = 只受部位金額限制")
     ap.add_argument("--grid", default="5x20,10x10,20x5",
                     help="部位%%x最大檔數，逗號分隔")
     args = ap.parse_args()
 
-    C, O, L, U, B, RAW = build_matrices()
+    C, O, L, U, B, RAW = build_matrices(args.market)
     print(f"母體矩陣 {C.shape[0]} 個交易日 × {C.shape[1]} 檔，"
           f"突破訊號 {int(B.values.sum())} 筆")
     bench = bench_curve(C, U)
