@@ -1,0 +1,84 @@
+name: 基本面資料回補（月營收 / 季報）
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset:
+        description: "要抓哪一組"
+        type: choice
+        required: true
+        default: both
+        options: [both, month, financial]
+      sleep:
+        description: "每檔間隔秒數（免費層要 6.5，Backer 可以 1~2）"
+        required: true
+        default: "2"
+      limit:
+        description: "只跑前 N 檔（0 = 全部；先用 20 試跑）"
+        required: true
+        default: "0"
+
+concurrency:
+  group: data-write
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安裝套件
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install pandas pyarrow numpy requests
+          fi
+
+      - name: 執行
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+        run: |
+          set -o pipefail
+          python scripts/backfill_fundamentals.py \
+            --dataset "${{ inputs.dataset }}" \
+            --sleep "${{ inputs.sleep }}" \
+            --limit "${{ inputs.limit }}" 2>&1 | tee run.log
+
+      # Actions 有 6 小時上限，抓不完是常態。
+      # 進度記在 _done_*.txt，所以先提交、下次按 Run 會從斷點續跑。
+      - name: 提交回 repo
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/fundamentals
+          if git diff --cached --quiet; then
+            echo "沒有變更，不提交"
+          else
+            git commit -m "chore(data): 基本面回補 ${{ inputs.dataset }}"
+            git pull --rebase --autostash
+            git push
+          fi
+
+      - name: 寫進 job summary
+        if: always()
+        continue-on-error: true
+        run: |
+          {
+            echo "## 基本面回補 \`${{ inputs.dataset }}\`"
+            echo ""
+            echo '```'
+            tail -c 200000 run.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
