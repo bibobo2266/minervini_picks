@@ -1,0 +1,124 @@
+name: 走動式驗證（walk-forward）
+
+on:
+  workflow_dispatch:
+    inputs:
+      capital:
+        description: "起始資金"
+        required: true
+        default: "10000000"
+      grid:
+        description: "配置：部位%x最大檔數（這支只吃一組）"
+        required: true
+        default: "2.5x40"
+      caps:
+        description: "要掃的股價上限，0 = 無上限"
+        required: true
+        default: "0,15,25,40,60,100,200"
+      start_year:
+        description: "第一個 OOS 年份（之前全部當訓練資料）"
+        required: true
+        default: "2019"
+      seeds:
+        description: "計分階段的隨機種子組數"
+        required: true
+        default: "4"
+      select_seeds:
+        description: "挑參數階段的種子組數（會跑很多次，設少一點）"
+        required: true
+        default: "2"
+      stop:
+        description: "停損 %"
+        required: true
+        default: "12"
+      market:
+        description: "市場別"
+        type: choice
+        required: true
+        default: all
+        options: [all, twse, tpex]
+      commit:
+        description: "把結果檔案提交回 repo"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: data-write
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安裝套件
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install pandas pyarrow numpy
+          fi
+          pip install tabulate
+
+      - name: 執行
+        run: |
+          set -o pipefail
+          python scripts/walkforward_validate.py \
+            --capital "${{ inputs.capital }}" \
+            --grid "${{ inputs.grid }}" \
+            --caps "${{ inputs.caps }}" \
+            --start-year "${{ inputs.start_year }}" \
+            --seeds "${{ inputs.seeds }}" \
+            --select-seeds "${{ inputs.select_seeds }}" \
+            --stop "${{ inputs.stop }}" \
+            --market "${{ inputs.market }}" 2>&1 | tee run.log
+
+      - name: 寫進 job summary（手機直接讀這裡）
+        if: always()
+        continue-on-error: true
+        run: |
+          {
+            echo "## 走動式驗證"
+            echo ""
+            echo "資金 \`${{ inputs.capital }}\`　配置 \`${{ inputs.grid }}\`　"
+            echo "上限候選 \`${{ inputs.caps }}\`　OOS 起始年 \`${{ inputs.start_year }}\`"
+            echo ""
+            echo '```'
+            tail -c 400000 run.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上傳結果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: walkforward
+          path: |
+            run.log
+            data/portfolio/**
+          if-no-files-found: warn
+
+      - name: 提交回 repo
+        if: ${{ inputs.commit }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/portfolio
+          if git diff --cached --quiet; then
+            echo "沒有變更，不提交"
+          else
+            git commit -m "chore(data): 走動式驗證結果"
+            git pull --rebase --autostash
+            git push
+          fi
