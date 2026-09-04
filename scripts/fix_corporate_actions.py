@@ -18,11 +18,17 @@ r"""
         修正方式是把歷史價「除以」比值。
       - 減資 / 反向分割 → 除權參考價「往上跳」（減資五成 = 價格翻倍），
         比值 < 1，修正方式等於把歷史價「乘上去」。
-      舊版只抓下跌，減資那一整類事件完全看不到。
 
-    例外：興櫃股票、上市前五個交易日沒有漲跌幅限制，±50% 對它們是合法的。
-    universe.parquet 的 type 欄位直接標了 twse / tpex / emerging，用它排除
-    興櫃比從價格猜可靠得多——539 檔興櫃如果用猜的會漏掉一大半。
+    ⚠️ 必須用上市日排除興櫃期間（這是最容易踩的坑）：
+        universe 的 `type` 是「現在的市場別」，不是「當時的」。一檔 2016 年
+        在興櫃、2019 年轉上市的股票，現在 type = twse，但它 2016 那段沒有
+        漲跌幅限制。只看 type 的話，實測命中 2,078 筆，其中 6550 一檔就佔
+        58 筆、6645 佔 53 筆——一檔股票不可能有 58 次公司行動。
+        而且不能改用「這檔在價格資料裡的第一天」代替上市日，因為興櫃期間的
+        價格也在資料裡，它看起來已經「上市好幾年」了。
+
+        跟 findings 裡「產業分類是現在的分類回貼歷史」是同一個坑：
+        任何來自 universe 的欄位都是現值，回貼歷史前先想一次。
 
     另一個誤判來源：停牌復牌首日、處置股解除處置，當天也可能沒有漲跌幅限制。
     這種不是公司行動，只能靠 --detect 產出的 CSV 人工剔除。兩段式流程就是
@@ -42,6 +48,10 @@ r"""
     python scripts/fix_corporate_actions.py --apply    # 依清單修正
     偵測結果是 CSV，你可以在套用前把誤判的列刪掉。自動修正價格資料是不可逆的
     操作，中間需要一個人看過。
+
+前置：
+    universe.parquet 要有 listing_date 欄。沒有的話先跑
+    FINMIND_TOKEN=xxx python scripts/update_universe.py
 
 用法：
     python scripts/fix_corporate_actions.py --detect
@@ -64,10 +74,11 @@ DATA_DIR = "data/adj"
 EVENTS = os.path.join(DATA_DIR, "corporate_actions_detected.csv")
 BACKUP = os.path.join(DATA_DIR, "_backup_before_fix")
 
-MOVE_LIMIT = 0.11      # 台股漲跌幅上限 10%，留 1% 緩衝給資料誤差（雙向）
-MIN_RATIO = 1.10       # 比值離 1 太近就不值得修（多半是資料雜訊）
-MAX_RATIO = 25.0       # 高於這個八成是資料錯誤，不是公司行動
-NEW_LIST_DAYS = 30     # 上市未滿這麼多天，前五日無漲跌幅限制的影響還在
+MOVE_LIMIT = 0.11          # 台股漲跌幅上限 10%，留 1% 緩衝給資料誤差（雙向）
+MIN_RATIO = 1.10           # 比值離 1 太近就不值得修（多半是資料雜訊）
+MAX_RATIO = 25.0           # 高於這個八成是資料錯誤，不是公司行動
+NEW_LIST_DAYS = 30         # 掛牌未滿這麼多天，前五日無漲跌幅限制的影響還在
+MAX_HITS_PER_STOCK = 6     # 同一檔命中超過這個數，八成是興櫃殘留而非公司行動
 
 # 乾淨比值候選：
 #   > 1  →  分割 / 面額變更 / 大額配股，除權日價格往下跳
@@ -117,33 +128,53 @@ def detect(d: pd.DataFrame, uni=None) -> pd.DataFrame:
     d = d[d["stock_id"].astype(str).str.match(r"^[1-9]\d{3}$")].copy()
     d = d[d["close"] > 0]
 
+    listing = {}
     if uni is not None and "type" in uni.columns:
         listed = set(uni[uni["type"].isin(["twse", "tpex"])].index.astype(str))
         n0 = d["stock_id"].nunique()
         d = d[d["stock_id"].astype(str).isin(listed)]
-        print(f"  排除興櫃與未知：{n0} → {d['stock_id'].nunique()} 檔"
-              "（興櫃無漲跌幅限制，±50% 對它們是合法的）")
+        print(f"  排除現為興櫃與未知：{n0} → {d['stock_id'].nunique()} 檔")
+
+        if "listing_date" in uni.columns:
+            ld = pd.to_datetime(uni["listing_date"], errors="coerce")
+            listing = {str(k): v for k, v in ld.dropna().items()}
+            print(f"  取得上市日 {len(listing)} 檔（用它排除轉板前的興櫃期間）")
+        else:
+            print("  ⚠️ universe 沒有 listing_date 欄，無法排除轉板前的興櫃期間，"
+                  "清單會有大量誤判。先跑 scripts/update_universe.py")
 
     g = d.groupby("stock_id", sort=False)
     d["prev_close"] = g["close"].shift()
     d["chg"] = d["close"] / d["prev_close"] - 1
-    # 一次算完每檔在資料裡的首日，取代舊版每筆命中重掃一次全表
+    # 沒有上市日時退回用資料首日。這只擋得住真正的新上市，擋不住轉板。
     d["first_date"] = g["date"].transform("min")
 
     hits = d[(d["chg"].abs() > MOVE_LIMIT) & d["prev_close"].notna()].copy()
     if hits.empty:
         return pd.DataFrame()
 
+    hit_count = hits["stock_id"].value_counts().to_dict()
+
     rows = []
     for _, e in hits.iterrows():
+        sid = str(e["stock_id"])
         prev_c, close_c = float(e["prev_close"]), float(e["close"])
         ratio, _gap = snap_ratio(prev_c, close_c)
-        days_since_listing = (e["date"] - e["first_date"]).days
+
+        base = listing.get(sid)
+        src = "上市日"
+        if base is None or base != base:
+            base, src = e["first_date"], "資料首日"
+        days_since_listing = (e["date"] - base).days
+
         direction = "往下跳（分割／面額變更）" if e["chg"] < 0 \
             else "往上跳（減資／反向分割）"
 
         if days_since_listing < NEW_LIST_DAYS:
-            verdict = "疑似新上市"
+            verdict = "興櫃期間或新上市"
+            ratio = ratio if ratio is not None else np.nan
+        elif hit_count.get(sid, 0) > MAX_HITS_PER_STOCK:
+            verdict = "同檔命中過多"
             ratio = ratio if ratio is not None else np.nan
         elif ratio is None:
             verdict = "找不到合理比值"
@@ -156,7 +187,7 @@ def detect(d: pd.DataFrame, uni=None) -> pd.DataFrame:
             if ratio is not None and ratio == ratio else np.nan
 
         rows.append({
-            "stock_id": e["stock_id"],
+            "stock_id": sid,
             "event_date": e["date"].date().isoformat(),
             "prev_close": round(prev_c, 4),
             "open": round(float(e.get("open", np.nan)), 4),
@@ -165,7 +196,9 @@ def detect(d: pd.DataFrame, uni=None) -> pd.DataFrame:
             "ratio": round(ratio, 6) if ratio is not None and ratio == ratio else np.nan,
             "還原後漲跌%": round(adj_chg, 1) if adj_chg == adj_chg else np.nan,
             "方向": direction,
-            "上市天數": days_since_listing,
+            "掛牌基準": src,
+            "掛牌天數": days_since_listing,
+            "同檔命中數": hit_count.get(sid, 0),
             "判定": verdict,
         })
 
@@ -270,9 +303,9 @@ def main():
         print(ev["方向"].value_counts().to_string())
 
         cols = ["stock_id", "event_date", "prev_close", "close", "ratio",
-                "chg%", "還原後漲跌%", "方向"]
+                "chg%", "還原後漲跌%", "方向", "同檔命中數"]
         rec = ev[ev["判定"] == "建議修正"]
-        print("\n判定為「建議修正」的（最近 20 筆）：")
+        print(f"\n判定為「建議修正」的 {len(rec)} 筆（最近 20 筆）：")
         print(rec.tail(20)[cols].to_string(index=False) if len(rec) else "  無")
 
         other = ev[ev["判定"] != "建議修正"]
