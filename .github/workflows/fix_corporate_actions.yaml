@@ -16,6 +16,10 @@ on:
         description: "排除的誤判（格式 6696@2019-05-20,4546@2020-01-02，留空表示不排除）"
         required: false
         default: ""
+      only:
+        description: "只做這幾筆（格式 8101@2024-11-19=0.20,2633@2015-12-25 ；=後面可指定比值。填了就忽略 exclude）"
+        required: false
+        default: ""
 
 # 不要跟回補 workflow 同時動 data/，會撞 commit
 concurrency:
@@ -46,28 +50,55 @@ jobs:
           fi
           pip install tabulate
 
-      - name: 排除誤判（把指定列的判定改掉）
-        if: ${{ inputs.mode != 'detect' && inputs.exclude != '' }}
+      - name: 調整清單（only 優先，其次 exclude）
+        if: ${{ inputs.mode != 'detect' && (inputs.only != '' || inputs.exclude != '') }}
         env:
           EXCLUDE: ${{ inputs.exclude }}
+          ONLY: ${{ inputs.only }}
         run: |
           python - <<'PY'
           import os, pandas as pd
           p = "data/adj/corporate_actions_detected.csv"
           df = pd.read_csv(p, dtype={"stock_id": str})
-          n = 0
-          for item in os.environ["EXCLUDE"].split(","):
-              item = item.strip()
-              if not item:
-                  continue
-              sid, _, day = item.partition("@")
-              m = (df["stock_id"] == sid.strip())
-              if day.strip():
-                  m &= (df["event_date"] == day.strip())
-              n += int((m & (df["判定"] == "建議修正")).sum())
-              df.loc[m, "判定"] = "人工排除"
+          only = [x.strip() for x in os.environ.get("ONLY", "").split(",") if x.strip()]
+
+          def key(item):
+              """回傳 (代號, 日期, 比值或 None)。格式 6696@2019-05-20=0.20"""
+              spec, _, ratio = item.partition("=")
+              sid, _, day = spec.partition("@")
+              return sid.strip(), day.strip(), (float(ratio) if ratio.strip() else None)
+
+          if only:
+              # 只保留列出的那幾筆，其餘一律不做
+              df.loc[df["判定"] == "建議修正", "判定"] = "未列入本次"
+              n = 0
+              for item in only:
+                  sid, day, ratio = key(item)
+                  m = df["stock_id"] == sid
+                  if day:
+                      m &= df["event_date"] == day
+                  if not m.any():
+                      raise SystemExit(f"only 指定的 {item} 在清單裡找不到")
+                  if ratio is not None:
+                      df.loc[m, "ratio"] = ratio
+                  df.loc[m, "判定"] = "建議修正"
+                  n += int(m.sum())
+              print(f"only 模式：只做 {n} 筆")
+          else:
+              n = 0
+              for item in os.environ["EXCLUDE"].split(","):
+                  item = item.strip()
+                  if not item:
+                      continue
+                  sid, day, _ = key(item)
+                  m = df["stock_id"] == sid
+                  if day:
+                      m &= df["event_date"] == day
+                  n += int((m & (df["判定"] == "建議修正")).sum())
+                  df.loc[m, "判定"] = "人工排除"
+              print(f"已排除 {n} 筆")
+
           df.to_csv(p, index=False, encoding="utf-8-sig")
-          print(f"已排除 {n} 筆")
           PY
 
       - name: 執行
