@@ -10,8 +10,16 @@ r"""
     這是這份資料最容易搞爛結論的地方，所以本程式在回補時就把 available_date
     算好寫進去。之後任何回測，一律用 available_date 過濾，不要用 date。
 
-    月營收：證交法第 36 條，每月 10 日以前公告上月營運情形。
-            → available_date = 次月 15 日（多留幾天緩衝）
+    月營收：⚠️ FinMind 的 date 已經是「營收所屬月份的次月 1 日」，
+            不是營收月份本身。實測 26.5 萬列全部如此
+            （revenue_month=7 對應 date=2026-08-01）。
+            證交法第 36 條規定每月 10 日以前公告上月營運情形，
+            → available_date = date + 14 天（留五天緩衝）
+            早期版本誤以為 date 是營收月份、又推了一個月，
+            結果晚了整整一個月。方向雖然安全，但月營收因子的價值
+            有一大半在新鮮度，晚一個月等於自廢武功。
+            create_time 欄看起來像公告日，但 95.8% 是空的
+            （最早只到 2026-04），歷史沒有回填，不能用。
 
     季報：Q1 → 5/15、Q2 → 8/14、Q3 → 11/14、年報 → 次年 3/31。
           → available_date 用上述法定期限
@@ -19,11 +27,12 @@ r"""
              一般公司的期限，所以金融股會有大約兩週的前視偏誤。要嚴謹的話，
              測因子時把金融股排除，或自己再往後推兩週。
 
-⚠️ 台灣的 Q2 是半年報，不是單季
-    第二季財報涵蓋 1–6 月整體，跟美股 10-Q 只涵蓋單季不同。
-    所以「單季 EPS」必須自己相減算出來（Q2單季 = 半年報 − Q1），
-    直接拿 FinMind 的數字當單季會錯得離譜。本程式只存原始值，不做這個換算，
-    換算留給因子腳本，但這件事寫在這裡免得忘記。
+✅ EPS 已經是單季，不用相減（實測確認）
+    台灣的第二季財報在制度上是半年報（涵蓋 1–6 月），所以原本擔心 FinMind
+    給的是累計值。實測 2330：2023 年四季 EPS 相加 = 32.34、2024 年 = 45.26，
+    與公告的全年 EPS 一致 → FinMind 已經幫你拆成單季了。
+    其他累計型科目（Revenue、OperatingIncome 等）沒有逐一驗證，
+    要用之前請個別確認。
 
 ⚠️ 財報重編
     FinMind 給的是「現在的」數字，不是當年公告的原始數字。被重編過的財報
@@ -96,10 +105,13 @@ def call(dataset: str, **params) -> pd.DataFrame:
 
 
 def month_available(d: pd.Series) -> pd.Series:
-    """月營收：所屬月份 → 次月 15 日。法定是次月 10 日前，留幾天緩衝。"""
-    d = pd.to_datetime(d)
-    nxt = (d.dt.to_period("M") + 1).dt.to_timestamp()
-    return nxt + pd.Timedelta(days=14)
+    """月營收可用日。
+
+    ⚠️ FinMind 的 date 已經是營收所屬月份的「次月 1 日」，不要再推一個月。
+    法定公告期限是次月 10 日前，這裡加 14 天留五天緩衝。
+    例：7 月營收 → date 2026-08-01 → available_date 2026-08-15
+    """
+    return pd.to_datetime(d) + pd.Timedelta(days=14)
 
 
 def quarter_available(d: pd.Series) -> pd.Series:
@@ -207,7 +219,6 @@ def main():
         run(k, sids, args.sleep, os.path.join(OUT_DIR, f"_done_{k}.txt"))
 
     print("\n⚠️ 之後做因子時：一律用 available_date 過濾，不要用 date。")
-    print("⚠️ 台灣 Q2 是半年報，單季 EPS 要自己相減。")
 
 
 if __name__ == "__main__":
