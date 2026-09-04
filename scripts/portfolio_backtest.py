@@ -114,7 +114,7 @@ def bench_curve(C, U):
     return np.concatenate([[1.0], np.cumprod(1 + daily)])
 
 
-def simulate(C, O, L, B, RAW, capital, pos_pct, max_pos, stop_pct, seed):
+def simulate(C, O, L, B, RAW, capital, pos_pct, max_pos, stop_pct, seed, maxprice=0.0):
     """事件驅動的有限資本模擬。回傳 (每日權益, 交易明細, 統計)。"""
     rng = np.random.default_rng(seed)
     dates = C.index
@@ -184,6 +184,9 @@ def simulate(C, O, L, B, RAW, capital, pos_pct, max_pos, stop_pct, seed):
             for j in take:
                 entry_px = o[t, j]
                 raw_px = raw[t, j] if np.isfinite(raw[t, j]) and raw[t, j] > 0 else entry_px
+                if maxprice and raw_px > maxprice:
+                    skipped.append((dates[t], sids[j], "超過股價上限"))
+                    continue
                 lots = int(budget // (raw_px * LOT))
                 if lots < 1:
                     skipped.append((dates[t], sids[j], "買不起整張"))
@@ -213,7 +216,8 @@ def simulate(C, O, L, B, RAW, capital, pos_pct, max_pos, stop_pct, seed):
                  平均投入比=invested / len(dates) * 100,
                  跳過訊號=len(skipped),
                  因滿倉跳過=sum(1 for s in skipped if s[2] == "滿倉"),
-                 因買不起跳過=sum(1 for s in skipped if s[2] == "買不起整張"))
+                 因買不起跳過=sum(1 for s in skipped if s[2] == "買不起整張"),
+                 因超過上限跳過=sum(1 for s in skipped if s[2] == "超過股價上限"))
     return equity, pd.DataFrame(trades), stats
 
 
@@ -242,6 +246,8 @@ def main():
     ap.add_argument("--capital", type=float, default=1_000_000)
     ap.add_argument("--stop", type=float, default=12.0, help="停損 %%")
     ap.add_argument("--seeds", type=int, default=10)
+    ap.add_argument("--maxprice", type=float, default=0.0,
+                    help="股價上限（元），0 = 只受部位金額限制")
     ap.add_argument("--grid", default="5x20,10x10,20x5",
                     help="部位%%x最大檔數，逗號分隔")
     args = ap.parse_args()
@@ -263,7 +269,8 @@ def main():
         best_eq = None
         for s in range(args.seeds):
             eq, tr, st = simulate(C, O, L, B, RAW, args.capital,
-                                  pos_pct, max_pos, args.stop / 100, seed=s)
+                                  pos_pct, max_pos, args.stop / 100, seed=s,
+                                  maxprice=args.maxprice)
             m, ann = metrics(eq, C.index, args.capital)
             m.update(st)
             runs.append(m)
@@ -272,7 +279,8 @@ def main():
         r = pd.DataFrame(runs)
         row = {"配置": f"{pp}% × {mp} 檔"}
         for k in ["CAGR", "最大回撤", "MAR", "最差年度", "最長水下交易日",
-                  "滿倉日比", "平均投入比", "因滿倉跳過", "因買不起跳過"]:
+                  "滿倉日比", "平均投入比", "因滿倉跳過", "因買不起跳過",
+                  "因超過上限跳過"]:
             row[k] = r[k].mean()
         row["CAGR標準差"] = r["CAGR"].std()
         row["交易筆數"] = len(best_tr)
