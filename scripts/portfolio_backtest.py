@@ -186,7 +186,8 @@ def simulate(C, O, L, B, RAW, capital, pos_pct, max_pos, stop_pct, seed, maxpric
             for j in take:
                 entry_px = o[t, j]
                 raw_px = raw[t, j] if np.isfinite(raw[t, j]) and raw[t, j] > 0 else entry_px
-                if maxprice and raw_px > maxprice:
+                cap = maxprice[t] if hasattr(maxprice, "__len__") else maxprice
+                if cap and raw_px > cap:
                     skipped.append((dates[t], sids[j], "超過股價上限"))
                     continue
                 lots = int(budget // (raw_px * LOT))
