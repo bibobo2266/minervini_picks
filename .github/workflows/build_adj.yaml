@@ -27,7 +27,9 @@ jobs:
         with:
           python-version: '3.11'
 
-      - run: pip install pandas numpy requests pyarrow
+      # ⚠️ pandas 3.0 的 to_datetime 不再自動推斷混合格式，
+      #    直接讀 parquet 的字串 date 欄會 ValueError，所以鎖版本。
+      - run: pip install "pandas<3" "numpy<3" requests pyarrow
 
       - name: Build
         env:
