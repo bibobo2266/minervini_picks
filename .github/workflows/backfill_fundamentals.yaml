@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       dataset:
-        description: "要抓哪一組"
+        description: "要抓哪一組（all = 月營收+季報+融資融券）"
         type: choice
         required: true
         default: both
-        options: [both, month, financial]
+        options: [both, all, month, financial, margin]
       sleep:
         description: "每檔間隔秒數（免費層要 6.5，Backer 可以 1~2）"
         required: true
