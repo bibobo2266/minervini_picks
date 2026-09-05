@@ -58,6 +58,16 @@ LOT = 1000                 # 一張 = 1000 股
 _HIGH = []                 # build_matrices 會把最高價矩陣放進來給 simulate 用
 _AGE = []                  # 突破歷史距離（上次高於現價是幾個交易日前）
 _SCORE = []                # 外掛的排序分數矩陣（例如月營收 YoY），--score-file 載入
+_ATR = []                  # ATR20 / 收盤價
+_BREADTH = []              # 母體中收盤價高於 200 日均的比例（逐日）
+
+# --atr-stop / --vol-size：實測全部比固定 -12% 差，預設關閉，保留供複驗。
+# --regime：上限 = base × 母體在 200 日均之上的比例（連續映射，不是門檻）。
+#   分段門檻要決定回看期、門檻值、幾段、每段曝險、延遲幾天——五個旋鈕、
+#   幾百種組合，一定找得到漂亮的一組。連續映射只有「200 日均」一個參數。
+#   既有部位不強制平倉，只限制新單。
+# ⚠️ 必須同時跑反向（1-breadth）與曝險配對（固定在平均允許檔數）兩個對照，
+#    否則分不出「timing 有資訊」與「單純少放錢所以少跌」。
 
 # 滿倉排序（--rank）：訊號多於空位時，用什麼順序決定誰先拿到位置。
 #   random  隨機抽（baseline。任何主觀篩選都在隨機丟掉右尾）
@@ -150,6 +160,7 @@ def build_matrices(market="all", breakout_days=BREAKOUT_DAYS, signal="simple"):
 
     C = d.pivot_table(index="date", columns="stock_id", values="close")
     H = d.pivot_table(index="date", columns="stock_id", values="max")
+    LO = d.pivot_table(index="date", columns="stock_id", values="min")
     O = d.pivot_table(index="date", columns="stock_id", values="open")
     L = d.pivot_table(index="date", columns="stock_id", values="min")
     T = d.pivot_table(index="date", columns="stock_id", values="Trading_money")
@@ -200,6 +211,14 @@ def build_matrices(market="all", breakout_days=BREAKOUT_DAYS, signal="simple"):
     RAW = C / F        # 近似的實際成交股價
     _HIGH.clear()
     _HIGH.append(H.reindex(columns=C.columns).values)
+    tr = (H.reindex(columns=C.columns) - LO.reindex(columns=C.columns)) / C
+    _ATR.clear()
+    _ATR.append(tr.rolling(20, min_periods=10).mean().values)
+    ma200 = C.rolling(200, min_periods=200).mean()
+    above = ((C > ma200) & U).sum(axis=1)
+    tot = (C.notna() & U).sum(axis=1)
+    _BREADTH.clear()
+    _BREADTH.append((above / tot.replace(0, np.nan)).ffill().fillna(0.5).values)
     return C, O, L, U, B, RAW
 
 
@@ -214,7 +233,7 @@ def bench_curve(C, U):
 
 def simulate(C, O, L, B, RAW, capital, pos_pct, max_pos, stop_pct, seed,
              maxprice=0.0, minprice=0.0, dead_days=0, dead_gain=0.05,
-             rank="random"):
+             rank="random", atr_stop=0.0, vol_size=False, regime="none"):
     """事件驅動的有限資本模擬。回傳 (每日權益, 交易明細, 統計)。"""
     rng = np.random.default_rng(seed)
     dates = C.index
@@ -223,6 +242,8 @@ def simulate(C, O, L, B, RAW, capital, pos_pct, max_pos, stop_pct, seed,
     hh = _HIGH[0] if _HIGH else c   # 期間最高價；沒帶就退回用收盤價
     ag = _AGE[0] if _AGE else None  # 突破歷史距離
     sc_ext = _SCORE[0] if _SCORE else None
+    atr = _ATR[0] if _ATR else None
+    bre = _BREADTH[0] if _BREADTH else None
     sig_i, sig_j = np.where(B.values)
     sig_by_day = {}
     for i, j in zip(sig_i, sig_j):
@@ -235,6 +256,8 @@ def simulate(C, O, L, B, RAW, capital, pos_pct, max_pos, stop_pct, seed,
     equity = np.zeros(len(dates))
     trades, skipped = [], []
     full_days = invested = 0
+    allowed_sum = 0
+    n_regime_skip = 0
 
     for t in range(len(dates)):
         cash += pending
@@ -276,7 +299,12 @@ def simulate(C, O, L, B, RAW, capital, pos_pct, max_pos, stop_pct, seed,
         cands = [j for j in cands
                  if j not in pos and t - last_entry.get(j, -10**9) > REENTRY_GAP
                  and np.isfinite(o[t, j]) and o[t, j] > 0]
-        slots = max_pos - len(pos)
+        eff_max = max_pos
+        if regime != "none" and bre is not None and t > 0:
+            b = float(bre[t - 1])          # point-in-time：只用 t-1 已知的
+            eff_max = int(round(max_pos * (1 - b if regime == "breadth_rev" else b)))
+        allowed_sum += eff_max
+        slots = max(0, eff_max - len(pos))
         mark = np.array([c[t, j] if np.isfinite(c[t, j]) else 0.0
                          for j in pos], dtype=float)
         cur_eq = cash + float((mark * np.array([pos[j]["shares"]
@@ -284,6 +312,8 @@ def simulate(C, O, L, B, RAW, capital, pos_pct, max_pos, stop_pct, seed,
         budget = cur_eq * pos_pct
 
         if cands:
+            if slots <= 0 and eff_max < max_pos:
+                n_regime_skip += len(cands)
             if len(cands) > slots:
                 if slots <= 0:
                     take = []
@@ -323,7 +353,12 @@ def simulate(C, O, L, B, RAW, capital, pos_pct, max_pos, stop_pct, seed,
                 if flr and raw_px < flr:
                     skipped.append((dates[t], sids[j], "低於股價下限"))
                     continue
-                lots = int(budget // (raw_px * LOT))
+                sd = stop_pct
+                if atr_stop and atr is not None and np.isfinite(atr[t - 1, j]):
+                    sd = float(np.clip(atr_stop * atr[t - 1, j], 0.08, 0.20))
+                bgt = budget * (stop_pct / sd) if vol_size else budget
+                bgt = float(np.clip(bgt, budget * 0.5, budget * 2.0))
+                lots = int(bgt // (raw_px * LOT))
                 if lots < 1:
                     skipped.append((dates[t], sids[j], "買不起整張"))
                     continue
@@ -338,19 +373,21 @@ def simulate(C, O, L, B, RAW, capital, pos_pct, max_pos, stop_pct, seed,
                     cost = entry_px * shares * (1 + COST / 2)
                 cash -= cost
                 pos[j] = dict(shares=shares, entry_px=entry_px, raw_px=raw_px,
-                              stop=entry_px * (1 - stop_pct), entry_i=t,
+                              stop=entry_px * (1 - sd), entry_i=t,
                               peak=entry_px)
                 last_entry[j] = t
 
         mv = sum(pos[j]["shares"] * (c[t, j] if np.isfinite(c[t, j])
                                      else pos[j]["entry_px"]) for j in pos)
         equity[t] = cash + mv
-        if len(pos) >= max_pos:
+        if len(pos) >= eff_max:
             full_days += 1
         invested += (mv / equity[t]) if equity[t] > 0 else 0
 
     tdf = pd.DataFrame(trades)
-    stats = dict(死錢出場=int((tdf["出場原因"] == "死錢").sum()) if len(tdf) else 0,
+    stats = dict(平均允許檔數=allowed_sum / len(dates),
+                 因節流跳過=n_regime_skip,
+                 死錢出場=int((tdf["出場原因"] == "死錢").sum()) if len(tdf) else 0,
                  滿倉日比=full_days / len(dates) * 100,
                  平均投入比=invested / len(dates) * 100,
                  跳過訊號=len(skipped),
@@ -402,6 +439,13 @@ def main():
                     help="死錢出場的觀察天數，0 = 關閉")
     ap.add_argument("--dead-gain", type=float, default=5.0,
                     help="死錢出場的最高漲幅門檻 %%（期間最高從未超過就算死錢）")
+    ap.add_argument("--regime", default="none",
+                    choices=["none", "breadth", "breadth_rev"],
+                    help="市場節流：上限 = base × 母體在 200 日均之上的比例")
+    ap.add_argument("--atr-stop", type=float, default=0.0,
+                    help="停損距離 = 倍數 × ATR20%%，夾在 8%%–20%%。0 = 固定停損")
+    ap.add_argument("--vol-size", action="store_true",
+                    help="部位大小 ∝ 1/停損距離（固定元風險）")
     ap.add_argument("--minprice", type=float, default=0.0,
                     help="股價下限（元），迴避水餃股／全額交割／處置股")
     ap.add_argument("--maxprice", type=float, default=0.0,
@@ -447,7 +491,9 @@ def main():
                                   minprice=args.minprice,
                                   dead_days=args.dead_days,
                                   dead_gain=args.dead_gain / 100,
-                                  rank=args.rank)
+                                  rank=args.rank, regime=args.regime,
+                                  atr_stop=args.atr_stop,
+                                  vol_size=args.vol_size)
             m, ann = metrics(eq, C.index, args.capital)
             m.update(st)
             runs.append(m)
@@ -456,7 +502,8 @@ def main():
         r = pd.DataFrame(runs)
         row = {"配置": f"{pp}% × {mp} 檔"}
         for k in ["CAGR", "最大回撤", "MAR", "最差年度", "最長水下交易日",
-                  "滿倉日比", "平均投入比", "死錢出場", "因滿倉跳過",
+                  "滿倉日比", "平均投入比", "平均允許檔數", "因節流跳過",
+                  "死錢出場", "因滿倉跳過",
                   "因買不起跳過", "因超過上限跳過", "因低於下限跳過"]:
             row[k] = r[k].mean()
         row["CAGR標準差"] = r["CAGR"].std()
