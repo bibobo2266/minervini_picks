@@ -14,7 +14,17 @@ on:
       caps:
         description: "要掃的股價上限，0 = 無上限"
         required: true
-        default: "0,15,25,40,60,100,200"
+        default: "25,30,40,60,100"
+      floors:
+        description: "要掃的股價下限（10 = 排除水餃股）。可多組如 10,15"
+        required: true
+        default: "10"
+      signal:
+        description: "訊號來源"
+        type: choice
+        required: true
+        default: simple
+        options: [simple, minervini]
       start_year:
         description: "第一個 OOS 年份（之前全部當訓練資料）"
         required: true
@@ -78,6 +88,8 @@ jobs:
             --capital "${{ inputs.capital }}" \
             --grid "${{ inputs.grid }}" \
             --caps "${{ inputs.caps }}" \
+            --floors "${{ inputs.floors }}" \
+            --signal "${{ inputs.signal }}" \
             --start-year "${{ inputs.start_year }}" \
             --seeds "${{ inputs.seeds }}" \
             --select-seeds "${{ inputs.select_seeds }}" \
@@ -92,7 +104,9 @@ jobs:
             echo "## 走動式驗證"
             echo ""
             echo "資金 \`${{ inputs.capital }}\`　配置 \`${{ inputs.grid }}\`　"
-            echo "上限候選 \`${{ inputs.caps }}\`　OOS 起始年 \`${{ inputs.start_year }}\`"
+            echo "上限候選 \`${{ inputs.caps }}\`　下限候選 \`${{ inputs.floors }}\`"
+            echo ""
+            echo "OOS 起始年 \`${{ inputs.start_year }}\`"
             echo ""
             echo '```'
             tail -c 400000 run.log
