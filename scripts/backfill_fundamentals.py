@@ -10,6 +10,9 @@ r"""
     這是這份資料最容易搞爛結論的地方，所以本程式在回補時就把 available_date
     算好寫進去。之後任何回測，一律用 available_date 過濾，不要用 date。
 
+    股利宣告：用 AnnouncementDate（董事會決議公告日），不是除息日。
+             因子的價值在「宣告到除息之間的重新定價」，用除息日就是前視偏誤。
+
     融資融券：證交所收盤後（約 21:00）公告當日餘額，所以 T 日的數字
              可以用在 T+1 開盤的決策上 → available_date = date 本身。
              ⚠️ 不能拿來做 T 日盤中的決策，那才是前視偏誤。
@@ -68,6 +71,7 @@ SETS = {
     "month": ("TaiwanStockMonthRevenue", "month_revenue.parquet"),
     "financial": ("TaiwanStockFinancialStatements", "financials.parquet"),
     "margin": ("TaiwanStockMarginPurchaseShortSale", "margin.parquet"),
+    "dividend": ("TaiwanStockDividend", "dividend.parquet"),
 }
 
 
@@ -148,6 +152,26 @@ def margin_available(d: pd.Series) -> pd.Series:
     return pd.to_datetime(d)
 
 
+def dividend_available(df: pd.DataFrame) -> pd.Series:
+    """股利宣告可用日 = 董事會決議公告日（AnnouncementDate）。
+
+    ⚠️ 這是這張表唯一有價值的欄位。因子的全部價值在「宣告日到除息日之間
+    的重新定價」——用除息日（CashExDividendTradingDate）當可用日就是前視偏誤，
+    因為那時候市場早就知道配多少了。
+
+    FinMind 的欄位名稱可能是 AnnouncementDate 或 announcement_date，
+    兩個都試；都沒有的話退回用 date 並印警告（那筆資料不可用於因子）。
+    """
+    for col in ("AnnouncementDate", "announcement_date"):
+        if col in df.columns:
+            av = pd.to_datetime(df[col], errors="coerce")
+            if av.notna().any():
+                # 缺公告日的列退回除息日，並在主程式統計比例
+                return av.fillna(pd.to_datetime(df["date"], errors="coerce"))
+    print("    ⚠️ 找不到 AnnouncementDate 欄，退回用 date（該資料不可用於因子）")
+    return pd.to_datetime(df["date"], errors="coerce")
+
+
 def universe():
     if os.path.exists(UNI):
         u = pd.read_parquet(UNI)
@@ -191,9 +215,13 @@ def run(kind, sids, sleep, done_path):
             fail += 1
         else:
             df["stock_id"] = sid
-            avail = {"month": month_available, "financial": quarter_available,
-                     "margin": margin_available}[kind]
-            df["available_date"] = avail(df["date"])
+            if kind == "dividend":
+                df["available_date"] = dividend_available(df)
+            else:
+                avail = {"month": month_available,
+                         "financial": quarter_available,
+                         "margin": margin_available}[kind]
+                df["available_date"] = avail(df["date"])
             df["available_date"] = df["available_date"].dt.strftime("%Y-%m-%d")
             buf.append(df)
             ok += 1
@@ -221,7 +249,8 @@ def run(kind, sids, sleep, done_path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", default="both",
-                    choices=["both", "all", "month", "financial", "margin"])
+                    choices=["both", "all", "month", "financial", "margin",
+                             "dividend"])
     ap.add_argument("--sleep", type=float, default=2.0,
                     help="每檔間隔秒數。免費層 600 req/hr 要設 6.5")
     ap.add_argument("--limit", type=int, default=0, help="只跑前 N 檔（測試用）")
@@ -236,7 +265,7 @@ def main():
     if args.dataset == "both":
         kinds = ["month", "financial"]
     elif args.dataset == "all":
-        kinds = ["month", "financial", "margin"]
+        kinds = ["month", "financial", "margin", "dividend"]
     else:
         kinds = [args.dataset]
     for k in kinds:
