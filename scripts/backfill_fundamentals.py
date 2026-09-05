@@ -10,6 +10,10 @@ r"""
     這是這份資料最容易搞爛結論的地方，所以本程式在回補時就把 available_date
     算好寫進去。之後任何回測，一律用 available_date 過濾，不要用 date。
 
+    融資融券：證交所收盤後（約 21:00）公告當日餘額，所以 T 日的數字
+             可以用在 T+1 開盤的決策上 → available_date = date 本身。
+             ⚠️ 不能拿來做 T 日盤中的決策，那才是前視偏誤。
+
     月營收：⚠️ FinMind 的 date 已經是「營收所屬月份的次月 1 日」，
             不是營收月份本身。實測 26.5 萬列全部如此
             （revenue_month=7 對應 date=2026-08-01）。
@@ -63,6 +67,7 @@ CHECKPOINT = 40
 SETS = {
     "month": ("TaiwanStockMonthRevenue", "month_revenue.parquet"),
     "financial": ("TaiwanStockFinancialStatements", "financials.parquet"),
+    "margin": ("TaiwanStockMarginPurchaseShortSale", "margin.parquet"),
 }
 
 
@@ -131,6 +136,18 @@ def quarter_available(d: pd.Series) -> pd.Series:
     return pd.Series(out, index=d.index)
 
 
+def margin_available(d: pd.Series) -> pd.Series:
+    """融資融券餘額可用日 = 交易日當天。
+
+    證交所在收盤後（約 21:00）公告當日餘額，所以 T 日的數字可以用在
+    T+1 開盤的決策上。本策略正是「T 日收盤產生訊號、T+1 開盤買」，
+    所以 available_date 設成 T 是正確的，不是前視偏誤。
+
+    ⚠️ 但不能用它做 T 日盤中的決策——那才是前視偏誤。
+    """
+    return pd.to_datetime(d)
+
+
 def universe():
     if os.path.exists(UNI):
         u = pd.read_parquet(UNI)
@@ -165,7 +182,8 @@ def run(kind, sids, sleep, done_path):
     print(f"已完成 {len(done)} 檔，本次要抓 {len(todo)} 檔，"
           f"預估 {len(todo) * sleep / 60:.0f} 分鐘")
 
-    key = ["stock_id", "date"] if kind == "month" else ["stock_id", "date", "type"]
+    key = (["stock_id", "date", "type"] if kind == "financial"
+           else ["stock_id", "date"])
     buf, ok, fail = [], 0, 0
     for i, sid in enumerate(todo, 1):
         df = call(dataset, data_id=sid, start_date=START)
@@ -173,8 +191,9 @@ def run(kind, sids, sleep, done_path):
             fail += 1
         else:
             df["stock_id"] = sid
-            df["available_date"] = (month_available(df["date"]) if kind == "month"
-                                    else quarter_available(df["date"]))
+            avail = {"month": month_available, "financial": quarter_available,
+                     "margin": margin_available}[kind]
+            df["available_date"] = avail(df["date"])
             df["available_date"] = df["available_date"].dt.strftime("%Y-%m-%d")
             buf.append(df)
             ok += 1
@@ -202,7 +221,7 @@ def run(kind, sids, sleep, done_path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", default="both",
-                    choices=["both", "month", "financial"])
+                    choices=["both", "all", "month", "financial", "margin"])
     ap.add_argument("--sleep", type=float, default=2.0,
                     help="每檔間隔秒數。免費層 600 req/hr 要設 6.5")
     ap.add_argument("--limit", type=int, default=0, help="只跑前 N 檔（測試用）")
@@ -214,7 +233,12 @@ def main():
         sids = sids[: args.limit]
     print(f"母體 {len(sids)} 檔")
 
-    kinds = ["month", "financial"] if args.dataset == "both" else [args.dataset]
+    if args.dataset == "both":
+        kinds = ["month", "financial"]
+    elif args.dataset == "all":
+        kinds = ["month", "financial", "margin"]
+    else:
+        kinds = [args.dataset]
     for k in kinds:
         run(k, sids, args.sleep, os.path.join(OUT_DIR, f"_done_{k}.txt"))
 
