@@ -41,15 +41,23 @@ import minervini_core as M  # noqa: E402
 HIGH_WIN = 250         # 創幾日新高才算訊號（250 個交易日 ≈ 52 週）
 COOLDOWN = 20          # 同一檔幾日內不重複收
 LIQ_PCT = 25.0         # 母體：成交值前幾 %
-STOP = 0.08            # 停損幅度
+STOP = 0.12            # 停損幅度。走動式驗證定案 -12%（-8% 是舊值）
 MAX_HOLD = 250         # 持有上限（交易日）
 MIN_HIST = 250         # 至少要有幾天歷史才納入
+
+# 以下四個由走動式驗證（OOS 2017-2026）定案，見 PRICE_BAND_FINDINGS.md
+CAPITAL = 1_000_000    # 本金
+POS_PCT = 0.04         # 單筆佔本金比例 → 4 萬
+MAX_POS = 25           # 同時持有上限。滿倉就跳過，不排隊
+MIN_PRICE = 10.0       # 股價下限：10 元以下是水餃股，全額交割與處置買不到
+MAX_PRICE = 30.0       # 股價上限：九年裡八年的走動式都選到 30
+LOT = 1000             # 一張 = 1000 股
 
 POS = "data/simple_positions.csv"
 REPORT = "SIGNALS.md"
 
 COLS = ["代號", "名稱", "產業", "訊號日", "進場日", "進場價", "停損價",
-        "狀態", "出場日", "出場價", "出場原因", "報酬%", "持有日"]
+        "張數", "投入金額", "狀態", "出場日", "出場價", "出場原因", "報酬%", "持有日"]
 
 
 def load_pos() -> pd.DataFrame:
@@ -111,11 +119,22 @@ def step(pos, m, today, max_new=0):
         px = o.at[today, sid] if today in o.index else np.nan
         if not np.isfinite(px) or px <= 0:
             continue
+        lots = int((CAPITAL * POS_PCT) // (float(px) * LOT))
+        if lots < 1:
+            # 開盤跳空到買不起整張。零股拿不到開盤價（首撮 9:10、只能限價、
+            # 獨立市場），所以直接放棄這筆，不要用零股補。
+            pos.at[k, "狀態"] = "已出場"
+            pos.at[k, "出場原因"] = "買不起整張"
+            filled.append(f"{sid} {r['名稱']} @ {px:.2f} 買不起整張，放棄")
+            continue
         pos.at[k, "進場日"] = today.date().isoformat()
         pos.at[k, "進場價"] = round(float(px), 2)
         pos.at[k, "停損價"] = round(float(px) * (1 - STOP), 2)
+        pos.at[k, "張數"] = lots
+        pos.at[k, "投入金額"] = int(round(float(px) * lots * LOT))
         pos.at[k, "狀態"] = "持有"
-        filled.append(f"{sid} {r['名稱']} @ {px:.2f}（停損 {px * (1 - STOP):.2f}）")
+        filled.append(f"{sid} {r['名稱']} @ {px:.2f} × {lots} 張 "
+                      f"= {px * lots * LOT:,.0f} 元（停損 {px * (1 - STOP):.2f}）")
 
     # 2) 持有中 -> 檢查停損與持有上限
     for k, r in pos[pos["狀態"] == "持有"].iterrows():
@@ -157,6 +176,25 @@ def step(pos, m, today, max_new=0):
                 recent.add(r["代號"])
     cands = [s for s in sigs if s not in live and s not in recent]
 
+    # 價格區間過濾。用當日收盤價判斷（隔日開盤買，會有小幅偏移，可接受）
+    band = []
+    for sid in cands:
+        px = c.at[today, sid] if today in c.index else np.nan
+        if np.isfinite(px) and MIN_PRICE <= px <= MAX_PRICE:
+            band.append(sid)
+    n_band = len(cands) - len(band)
+    cands = band
+
+    # 滿倉就不收。排隊會改變訊號本身——「17 天前突破的股票現在買」是另一個策略
+    slots = MAX_POS - len(live)
+    n_full = 0
+    if slots <= 0:
+        n_full = len(cands)
+        cands = []
+    elif len(cands) > slots:
+        n_full = len(cands) - slots
+        max_new = slots if not max_new else min(max_new, slots)
+
     if max_new and len(cands) > max_new:
         # 用日期當種子隨機取樣。刻意不排序後取前 N——任何排序都是在挑單，
         # 而回測顯示 edge 集中在極少數交易，主觀挑單會隨機丟掉獲利來源。
@@ -174,7 +212,7 @@ def step(pos, m, today, max_new=0):
         added.append(f"{sid} {nm}（{ind}）收 {c.at[today, sid]:.2f}")
     if rows:
         pos = pd.concat([pos, pd.DataFrame(rows)], ignore_index=True)
-    return pos, filled, exited, added, len(sigs)
+    return pos, filled, exited, added, len(sigs), n_band, n_full
 
 
 def summary(pos):
@@ -189,11 +227,17 @@ def summary(pos):
             f"最佳 {r.max():+.0f}%　最差 {r.min():+.0f}%　持有中 {len(hold)} 檔")
 
 
-def report(pos, m, today, filled, exited, added, n_sig, max_new):
+def report(pos, m, today, filled, exited, added, n_sig, max_new,
+           n_band=0, n_full=0):
     c = m["c"]
     L = [f"# 動能訊號 {today.date()}", "",
          f"規則：創 {HIGH_WIN} 日新高 → 隔日開盤買 → -{STOP:.0%} 停損 → "
-         f"抱到出場（上限 {MAX_HOLD} 日）｜母體：成交值前 {LIQ_PCT:.0f}%", ""]
+         f"抱到出場（上限 {MAX_HOLD} 日）｜母體：成交值前 {LIQ_PCT:.0f}%", "",
+         f"股價區間 {MIN_PRICE:.0f}–{MAX_PRICE:.0f} 元｜單筆 "
+         f"{CAPITAL * POS_PCT:,.0f} 元｜同時上限 {MAX_POS} 檔", "",
+         (f"今天因價格區間濾掉 {n_band} 檔"
+          + (f"、因滿倉跳過 {n_full} 檔" if n_full else "")
+          if (n_band or n_full) else ""), ""]
     L += [f"今日全市場新高訊號 **{n_sig}** 檔"
           + (f"，隨機取 {max_new} 檔" if max_new else "，全數收錄"), ""]
 
@@ -250,12 +294,14 @@ def main():
     today = m["c"].index[-1]
     print(f"資料最新日 {today.date()}　母體 {m['c'].shape[1]} 檔")
 
-    pos, filled, exited, added, n_sig = step(pos, m, today, args.max_new)
+    pos, filled, exited, added, n_sig, n_band, n_full = step(
+        pos, m, today, args.max_new)
 
     os.makedirs("data", exist_ok=True)
     pos.to_csv(POS, index=False, encoding="utf-8-sig")
     with open(REPORT, "w", encoding="utf-8") as f:
-        f.write(report(pos, m, today, filled, exited, added, n_sig, args.max_new))
+        f.write(report(pos, m, today, filled, exited, added, n_sig,
+                       args.max_new, n_band, n_full))
 
     print(f"新訊號 {n_sig} 檔，收錄 {len(added)}；成交 {len(filled)}；"
           f"出場 {len(exited)}")
