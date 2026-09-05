@@ -115,6 +115,11 @@ def main():
     for y in oos_years:
         i1 = int(np.searchsorted(dates, pd.Timestamp(f"{y}-01-01"))) - 1
         if i1 < 400:
+            # 訓練樣本太短（250 日新高本身要 250 天暖身），這一年沒有選參數，
+            # 會退回用 floors[0] / caps[0] 的預設值。這不是前視偏誤，
+            # 但那一年的績效不能算走動式的功勞。
+            print(f"  ⚠️ {y} 年訓練資料只有 {i1} 個交易日（<400），"
+                  f"該年改用預設參數，不列入走動式選擇")
             continue
         tr = slice_all([C, O, L, B, RAW], 0, i1)
         best, best_mar = None, -1e9
@@ -203,11 +208,21 @@ def main():
     print(res.to_string(index=False))
     print("\nA 走動式的逐年報酬 %：")
     print("  " + "  ".join(f"{d.year}:{v*100:.0f}" for d, v in wf_ann.items()))
-    print("\n判讀：")
-    print("  A 明顯低於 C → 我上一輪的 17.2% 有相當比例是掃參數掃出來的")
-    print("  A 不高於 B   → 這個參數不值得挑，固定下限以上全做就好")
-    print("  A 不高於 D   → 打不贏直接買 0050，那就不值得做")
+    g = {r["組別"][:1]: r for r in rows}
+    A, Bx, Cx = g["A"]["CAGR"], g["B"]["CAGR"], g["C"]["CAGR"]
+    D = min(r["CAGR"] for r in rows if r["組別"].startswith("D"))
+    print("\n判讀（依實際數字）：")
+    print(f"  A vs C：{A:.2f} vs {Cx:.2f} → " + (
+        f"掃參數灌了約 {Cx - A:.1f} 個百分點的水" if A < Cx - 0.5 else
+        "走動式不輸偷看未來，代表參數選擇沒有過度配適"))
+    print(f"  A vs B：{A:.2f} vs {Bx:.2f} → " + (
+        "這個參數值得挑" if A > Bx + 0.5 else
+        "這個參數不值得挑，固定下限以上全做就好"))
+    print(f"  A vs D：{A:.2f} vs {D:.2f} → " + (
+        "打贏買進持有 ETF" if A > D else
+        "打不贏直接買 ETF，單獨執行不划算（但仍可能有分散價值）"))
     print("  E 只是參考。它每天要對幾百檔再平衡，不是你能買的東西。")
+    print("  ⚠️ 擴張窗口的各年訓練樣本高度重疊，參數穩定 ≠ 多次獨立驗證。")
 
 
 if __name__ == "__main__":
