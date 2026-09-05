@@ -57,12 +57,13 @@ def slice_all(mats, i0, i1):
     return [m.iloc[i0:i1 + 1] for m in mats]
 
 
-def score(C, O, L, B, RAW, capital, pos_pct, max_pos, stop, cap, seeds):
+def score(C, O, L, B, RAW, capital, pos_pct, max_pos, stop, cap, seeds,
+          floor=0.0):
     """回傳多組種子的平均 MAR 與 CAGR。"""
     mars, cagrs = [], []
     for s in range(seeds):
         eq, _tr, _st = simulate(C, O, L, B, RAW, capital, pos_pct, max_pos,
-                                stop, seed=s, maxprice=cap)
+                                stop, seed=s, maxprice=cap, minprice=floor)
         m, _ = metrics(eq, C.index, capital)
         if np.isfinite(m["MAR"]):
             mars.append(m["MAR"])
@@ -75,28 +76,39 @@ def main():
     ap.add_argument("--capital", type=float, default=10_000_000)
     ap.add_argument("--stop", type=float, default=12.0)
     ap.add_argument("--grid", default="2.5x40", help="部位%%x最大檔數")
-    ap.add_argument("--caps", default="0,15,25,40,60,100,200",
+    ap.add_argument("--caps", default="25,30,40,60,100",
                     help="要掃的股價上限，0 = 無上限")
+    ap.add_argument("--floors", default="10",
+                    help="要掃的股價下限，逗號分隔。10 = 排除水餃股")
     ap.add_argument("--seeds", type=int, default=4)
     ap.add_argument("--select-seeds", type=int, default=2,
                     help="挑參數階段的種子數（會跑很多次，設少一點）")
     ap.add_argument("--start-year", type=int, default=2019,
                     help="第一個 OOS 年份；之前的年份全部拿來當訓練資料")
     ap.add_argument("--market", default="all", choices=["all", "twse", "tpex"])
+    ap.add_argument("--signal", default="simple",
+                    choices=["simple", "minervini"],
+                    help="simple = 純 250 日新高；minervini = 再加八條趨勢模板")
+    ap.add_argument("--breakout-days", type=int, default=250,
+                    help="創幾日新高（250 / 500 / 750）")
     args = ap.parse_args()
 
     pp, mp = args.grid.split("x")
     pos_pct, max_pos = float(pp) / 100, int(mp)
     stop = args.stop / 100
     caps = [float(x) for x in args.caps.split(",")]
+    floors = [float(x) for x in args.floors.split(",")]
+    combos = [(f, c) for f in floors for c in caps if c == 0 or c > f]
 
     os.makedirs(OUT_DIR, exist_ok=True)   # 要在任何寫檔之前建好
-    C, O, L, U, B, RAW = build_matrices(args.market)
+    C, O, L, U, B, RAW = build_matrices(args.market, args.breakout_days,
+                                        args.signal)
     dates = C.index
     years = sorted(set(dates.year))
     oos_years = [y for y in years if y >= args.start_year]
     print(f"資料 {dates[0].date()} → {dates[-1].date()}，"
-          f"OOS 年份 {oos_years[0]}–{oos_years[-1]}\n")
+          f"OOS 年份 {oos_years[0]}–{oos_years[-1]}，"
+          f"{args.signal} 訊號 {int(B.values.sum())} 筆\n")
 
     # ---- 第一步：每年用「當年以前」的資料挑上限 ----
     chosen = {}
@@ -107,41 +119,44 @@ def main():
         tr = slice_all([C, O, L, B, RAW], 0, i1)
         best, best_mar = None, -1e9
         line = []
-        for cap in caps:
+        for fl, cap in combos:
             mar, cagr = score(*tr, args.capital, pos_pct, max_pos, stop,
-                              cap, args.select_seeds)
-            line.append(f"{int(cap) if cap else '無'}:{mar:.2f}")
+                              cap, args.select_seeds, floor=fl)
+            line.append(f"{int(fl)}-{int(cap) if cap else '∞'}:{mar:.2f}")
             if mar > best_mar:
-                best, best_mar = cap, mar
+                best, best_mar = (fl, cap), mar
         chosen[y] = best
-        print(f"  訓練到 {y-1} 年底 → 選 上限 "
-              f"{int(best) if best else '無'} 元　(MAR {' '.join(line)})")
+        print(f"  訓練到 {y-1} 年底 → 選 {int(best[0])}–"
+              f"{int(best[1]) if best[1] else '∞'} 元　(MAR {' '.join(line)})")
 
     # ---- 第二步：一條連續模擬，只有新進場套用當年參數 ----
     i0 = int(np.searchsorted(dates, pd.Timestamp(f"{oos_years[0]}-01-01")))
     oos = slice_all([C, O, L, B, RAW], i0, len(dates) - 1)
     od = oos[0].index
-    wf_caps = np.array([chosen.get(d.year, 0.0) for d in od], dtype=float)
+    dflt = (floors[0], caps[0])
+    wf_caps = np.array([chosen.get(d.year, dflt)[1] for d in od], dtype=float)
+    wf_floors = np.array([chosen.get(d.year, dflt)[0] for d in od], dtype=float)
 
     # 全樣本最佳（偷看未來的對照組）
     full_best, full_mar = None, -1e9
-    for cap in caps:
+    for fl, cap in combos:
         mar, _ = score(C, O, L, B, RAW, args.capital, pos_pct, max_pos,
-                       stop, cap, args.select_seeds)
+                       stop, cap, args.select_seeds, floor=fl)
         if mar > full_mar:
-            full_best, full_mar = cap, mar
+            full_best, full_mar = (fl, cap), mar
 
+    fb = f"{int(full_best[0])}–{int(full_best[1]) if full_best[1] else '∞'}"
     runs = {
-        "A 走動式選參數（誠實）": wf_caps,
-        "B 固定無上限": 0.0,
-        f"C 固定用全樣本最佳 {int(full_best) if full_best else '無'} 元（偷看未來）": full_best,
+        "A 走動式選參數（誠實）": (wf_floors, wf_caps),
+        f"B 固定 {int(floors[0])} 元以上不設上限": (floors[0], 0.0),
+        f"C 固定用全樣本最佳 {fb} 元（偷看未來）": full_best,
     }
     rows = []
-    for name, cap in runs.items():
+    for name, (fl, cap) in runs.items():
         ms = []
         for s in range(args.seeds):
             eq, tr, _st = simulate(*oos, args.capital, pos_pct, max_pos,
-                                   stop, seed=s, maxprice=cap)
+                                   stop, seed=s, maxprice=cap, minprice=fl)
             m, ann = metrics(eq, od, args.capital)
             m["交易筆數"] = len(tr)
             ms.append(m)
@@ -190,7 +205,7 @@ def main():
     print("  " + "  ".join(f"{d.year}:{v*100:.0f}" for d, v in wf_ann.items()))
     print("\n判讀：")
     print("  A 明顯低於 C → 我上一輪的 17.2% 有相當比例是掃參數掃出來的")
-    print("  A 不高於 B   → 這個參數不值得挑，固定不設上限就好")
+    print("  A 不高於 B   → 這個參數不值得挑，固定下限以上全做就好")
     print("  A 不高於 D   → 打不贏直接買 0050，那就不值得做")
     print("  E 只是參考。它每天要對幾百檔再平衡，不是你能買的東西。")
 

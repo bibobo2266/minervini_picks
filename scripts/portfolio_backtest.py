@@ -56,7 +56,25 @@ DATA_DIR = "data/adj"
 OUT_DIR = "data/portfolio"
 LOT = 1000                 # 一張 = 1000 股
 _HIGH = []                 # build_matrices 會把最高價矩陣放進來給 simulate 用
-BREAKOUT_DAYS = 250        # 創幾日新高
+_AGE = []                  # 突破歷史距離（上次高於現價是幾個交易日前）
+_SCORE = []                # 外掛的排序分數矩陣（例如月營收 YoY），--score-file 載入
+
+# 滿倉排序（--rank）：訊號多於空位時，用什麼順序決定誰先拿到位置。
+#   random  隨機抽（baseline。任何主觀篩選都在隨機丟掉右尾）
+#   age     突破歷史距離越久越優先
+#   age_rev 反向，當作對照組——如果 age 有效，反向就該明顯變差
+# 為什麼是排序不是濾網：750 日新高的逐筆品質確實比 250 日好（前三大贏家
+# 完全相同），但硬篩成 ≥750 日會讓平均投入比從 69% 掉到 49%，補曝險又要
+# 用集中度換，回撤從 -34% 惡化到 -47%。排序不減少任何訊號，
+# participation 不變，資金閒置成本為零。
+# ⚠️ 750 日新高是 250 日新高的子集合，兩者不是競爭關係，是巢狀層級。
+BREAKOUT_DAYS = 250        # 創幾日新高（可用 --breakout-days 覆寫）
+# 逐筆掃描顯示回看窗口越長越好，且單調：
+#   60D +0.34 / 120D +1.23 / 250D +2.11 / 350D +2.18 / 500D +2.70 / 750D +3.32
+#   （120 個交易日持有期的平均超額 %，同母體同基準，已扣 0.60% 成本）
+# 直覺：三年新高代表走出更大的底部，重新定價幅度更大。訊號數也少一半
+# （750D 20,806 筆 vs 250D 38,883 筆），對有限資本的容量瓶頸是加分。
+# ⚠️ 窗口長度是掃出來的，一定要走 walkforward_validate.py 才算數。
 REENTRY_GAP = 20           # 同一檔幾個交易日內不重複進場
 MAX_HOLD = 250             # 最大持有交易日數
 
@@ -86,7 +104,36 @@ def load_etf(sid="0050"):
     return d.sort_values("date").set_index("date")["close"]
 
 
-def build_matrices(market="all"):
+def minervini_template(C):
+    """Minervini SEPA 趨勢模板（八條）。回傳布林矩陣。
+
+    ① 股價 > 150 日均 且 > 200 日均
+    ② 150 日均 > 200 日均
+    ③ 200 日均至少上升一個月（用 20 個交易日）
+    ④ 50 日均 > 150 日均 且 > 200 日均
+    ⑤ 股價 > 50 日均
+    ⑥ 股價離 52 週低點至少 30%
+    ⑦ 股價離 52 週高點 25% 以內
+    ⑧ RS ≥ 70（六個月報酬的橫斷面百分位）
+
+    ⚠️ 原 findings 已證明這八條是負貢獻（逐筆超額 +2.40 vs 笨基準 +3.89），
+    這裡重新實作是為了在「25 元以上的可執行區間」重測一次——
+    因為那八條要求「離低點遠、離高點近、RS 高」，可能天生避開水餃股，
+    所以在受限區間裡兩者的差距未必還是同一個方向。
+    """
+    ma50 = C.rolling(50).mean()
+    ma150 = C.rolling(150).mean()
+    ma200 = C.rolling(200).mean()
+    lo52 = C.rolling(250, min_periods=250).min()
+    hi52 = C.rolling(250, min_periods=250).max()
+    rs = (C / C.shift(126) - 1).rank(axis=1, pct=True) * 100
+    return ((C > ma150) & (C > ma200) & (ma150 > ma200)
+            & (ma200 > ma200.shift(20)) & (ma50 > ma150) & (ma50 > ma200)
+            & (C > ma50) & (C >= lo52 * 1.30) & (C >= hi52 * 0.75)
+            & (rs >= 70))
+
+
+def build_matrices(market="all", breakout_days=BREAKOUT_DAYS, signal="simple"):
     fs = sorted(glob.glob(os.path.join(DATA_DIR, "prices_adj_*.parquet")))
     if not fs:
         raise SystemExit(f"{DATA_DIR} 底下沒有 prices_adj_*.parquet")
@@ -110,8 +157,10 @@ def build_matrices(market="all"):
     # 母體：當日成交值前 25%
     U = (T.rank(axis=1, pct=True, ascending=False) <= UNIVERSE_PCT) & C.notna()
     # 250 日新高，且前一日不是新高
-    prior = C.shift(1).rolling(BREAKOUT_DAYS, min_periods=BREAKOUT_DAYS).max()
+    prior = C.shift(1).rolling(breakout_days, min_periods=breakout_days).max()
     B = (C > prior) & (C.shift(1) <= prior.shift(1)) & U
+    if signal == "minervini":
+        B = B & minervini_template(C)
 
     # 還原因子 → 實際成交股價（算張數用）
     F = pd.DataFrame(1.0, index=C.index, columns=C.columns)
@@ -128,6 +177,26 @@ def build_matrices(market="all"):
             F[sid] = s[::-1].cumprod()[::-1].shift(-1).fillna(1.0)
     else:
         print("  ⚠️ 找不到 dividend_events.parquet，張數會用還原價算，會偏寬鬆")
+    # 突破歷史距離：往回找最近一次收盤高於今日收盤，是幾個交易日前。
+    # 用擴張窗口的累積最高價分段算，避免逐檔迴圈。
+    cv = C.values
+    age = np.zeros_like(cv)
+    for j in range(cv.shape[1]):
+        col = cv[:, j]
+        last_hi = -1          # 最近一次「高於當前價」的位置
+        run = np.full(len(col), np.nan)
+        stack = []            # 單調遞減堆疊，存 (index, price)
+        for i, v in enumerate(col):
+            if not np.isfinite(v):
+                continue
+            while stack and stack[-1][1] <= v:
+                stack.pop()
+            run[i] = (i - stack[-1][0]) if stack else i + 1
+            stack.append((i, v))
+        age[:, j] = run
+    _AGE.clear()
+    _AGE.append(age)
+
     RAW = C / F        # 近似的實際成交股價
     _HIGH.clear()
     _HIGH.append(H.reindex(columns=C.columns).values)
@@ -144,13 +213,16 @@ def bench_curve(C, U):
 
 
 def simulate(C, O, L, B, RAW, capital, pos_pct, max_pos, stop_pct, seed,
-             maxprice=0.0, dead_days=0, dead_gain=0.05):
+             maxprice=0.0, minprice=0.0, dead_days=0, dead_gain=0.05,
+             rank="random"):
     """事件驅動的有限資本模擬。回傳 (每日權益, 交易明細, 統計)。"""
     rng = np.random.default_rng(seed)
     dates = C.index
     sids = np.array(C.columns)
     c, o, lo, raw = C.values, O.values, L.values, RAW.values
     hh = _HIGH[0] if _HIGH else c   # 期間最高價；沒帶就退回用收盤價
+    ag = _AGE[0] if _AGE else None  # 突破歷史距離
+    sc_ext = _SCORE[0] if _SCORE else None
     sig_i, sig_j = np.where(B.values)
     sig_by_day = {}
     for i, j in zip(sig_i, sig_j):
@@ -213,9 +285,23 @@ def simulate(C, O, L, B, RAW, capital, pos_pct, max_pos, stop_pct, seed,
 
         if cands:
             if len(cands) > slots:
-                # 訊號多於空位 → 隨機抽，不做主觀篩選
-                take = list(rng.choice(cands, size=max(slots, 0), replace=False)) \
-                    if slots > 0 else []
+                if slots <= 0:
+                    take = []
+                elif rank == "random":
+                    # baseline：隨機抽，不做主觀篩選
+                    take = list(rng.choice(cands, size=slots, replace=False))
+                else:
+                    # 只有在真正發生資本競爭時才排序，訊號本身一個都沒少
+                    src = sc_ext if rank.startswith("score") else ag
+                    if src is None:
+                        take = list(rng.choice(cands, size=slots, replace=False))
+                    else:
+                        sc = np.array([src[t - 1, j]
+                                       if np.isfinite(src[t - 1, j]) else -1e18
+                                       for j in cands])
+                        if rank.endswith("_rev"):
+                            sc = np.where(sc > -1e17, -sc, -1e18)
+                        take = [cands[k] for k in np.argsort(-sc)[:slots]]
                 for j in cands:
                     if j not in take:
                         skipped.append((dates[t], sids[j], "滿倉"))
@@ -227,6 +313,15 @@ def simulate(C, O, L, B, RAW, capital, pos_pct, max_pos, stop_pct, seed,
                 cap = maxprice[t] if hasattr(maxprice, "__len__") else maxprice
                 if cap and raw_px > cap:
                     skipped.append((dates[t], sids[j], "超過股價上限"))
+                    continue
+                # 股價下限：25 元以下在台股多為水餃股，常見全額交割與處置。
+                # 全額交割要圈存全額價金、券商多有限制；處置股是人工撮合
+                # （每 5–20 分鐘一次），而本策略是隔日開盤買，處置期間拿不到
+                # 開盤價。這兩個障礙回測完全模擬不了，只能用下限迴避。
+                # （下市風險不在此列——還原股價含已下市個股，沒有生存者偏差。）
+                flr = minprice[t] if hasattr(minprice, "__len__") else minprice
+                if flr and raw_px < flr:
+                    skipped.append((dates[t], sids[j], "低於股價下限"))
                     continue
                 lots = int(budget // (raw_px * LOT))
                 if lots < 1:
@@ -261,7 +356,8 @@ def simulate(C, O, L, B, RAW, capital, pos_pct, max_pos, stop_pct, seed,
                  跳過訊號=len(skipped),
                  因滿倉跳過=sum(1 for s in skipped if s[2] == "滿倉"),
                  因買不起跳過=sum(1 for s in skipped if s[2] == "買不起整張"),
-                 因超過上限跳過=sum(1 for s in skipped if s[2] == "超過股價上限"))
+                 因超過上限跳過=sum(1 for s in skipped if s[2] == "超過股價上限"),
+                 因低於下限跳過=sum(1 for s in skipped if s[2] == "低於股價下限"))
     return equity, pd.DataFrame(trades), stats
 
 
@@ -292,19 +388,36 @@ def main():
     ap.add_argument("--seeds", type=int, default=10)
     ap.add_argument("--market", default="all", choices=["all", "twse", "tpex"],
                     help="⚠️ universe 的 type 是現值，轉板股會被回貼成現在的市場別")
+    ap.add_argument("--score-file", default="",
+                    help="外掛排序分數的 .npy（形狀要跟收盤價矩陣一致）")
+    ap.add_argument("--rank", default="random",
+                    choices=["random", "age", "age_rev", "score", "score_rev"],
+                    help="滿倉時的排序方式（age = 突破歷史距離越久越優先）")
+    ap.add_argument("--signal", default="simple",
+                    choices=["simple", "minervini"],
+                    help="simple = 純 250 日新高；minervini = 再加八條趨勢模板")
+    ap.add_argument("--breakout-days", type=int, default=BREAKOUT_DAYS,
+                    help="創幾日新高（250 / 500 / 750）")
     ap.add_argument("--dead-days", type=int, default=0,
                     help="死錢出場的觀察天數，0 = 關閉")
     ap.add_argument("--dead-gain", type=float, default=5.0,
                     help="死錢出場的最高漲幅門檻 %%（期間最高從未超過就算死錢）")
+    ap.add_argument("--minprice", type=float, default=0.0,
+                    help="股價下限（元），迴避水餃股／全額交割／處置股")
     ap.add_argument("--maxprice", type=float, default=0.0,
                     help="股價上限（元），0 = 只受部位金額限制")
     ap.add_argument("--grid", default="5x20,10x10,20x5",
                     help="部位%%x最大檔數，逗號分隔")
     args = ap.parse_args()
 
-    C, O, L, U, B, RAW = build_matrices(args.market)
+    C, O, L, U, B, RAW = build_matrices(args.market, args.breakout_days,
+                                        args.signal)
+    if args.score_file:
+        _SCORE.clear()
+        _SCORE.append(np.load(args.score_file))
+        print(f"  載入排序分數 {args.score_file}")
     print(f"母體矩陣 {C.shape[0]} 個交易日 × {C.shape[1]} 檔，"
-          f"突破訊號 {int(B.values.sum())} 筆")
+          f"{args.signal} 訊號 {int(B.values.sum())} 筆")
     bench = bench_curve(C, U)
     yrs = (C.index[-1] - C.index[0]).days / 365.25
     print(f"基準（{C.index[0].date()} → {C.index[-1].date()}）")
@@ -331,8 +444,10 @@ def main():
             eq, tr, st = simulate(C, O, L, B, RAW, args.capital,
                                   pos_pct, max_pos, args.stop / 100, seed=s,
                                   maxprice=args.maxprice,
+                                  minprice=args.minprice,
                                   dead_days=args.dead_days,
-                                  dead_gain=args.dead_gain / 100)
+                                  dead_gain=args.dead_gain / 100,
+                                  rank=args.rank)
             m, ann = metrics(eq, C.index, args.capital)
             m.update(st)
             runs.append(m)
@@ -342,7 +457,7 @@ def main():
         row = {"配置": f"{pp}% × {mp} 檔"}
         for k in ["CAGR", "最大回撤", "MAR", "最差年度", "最長水下交易日",
                   "滿倉日比", "平均投入比", "死錢出場", "因滿倉跳過",
-                  "因買不起跳過", "因超過上限跳過"]:
+                  "因買不起跳過", "因超過上限跳過", "因低於下限跳過"]:
             row[k] = r[k].mean()
         row["CAGR標準差"] = r["CAGR"].std()
         row["交易筆數"] = len(best_tr)
