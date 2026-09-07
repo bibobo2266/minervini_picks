@@ -34,6 +34,16 @@ import lesson_core as lc
 LESSON_SELECTOR = lc.LESSON_SELECTOR
 
 
+def _f(v, spec="{:.2f}"):
+    """格式化可能是 NaN／None 的數值，避免整批中斷。"""
+    try:
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return "—"
+        return spec.format(v)
+    except Exception:
+        return "—"
+
+
 def build_pool(df: pd.DataFrame, taiex, min_events_per_stock: int = 0) -> pd.DataFrame:
     rows = []
     ids = [s for s in df["stock_id"].astype(str).unique()
@@ -155,7 +165,9 @@ def main():
     todo = [l for l in lc.LESSONS
             if args.lessons is None or l.cid in args.lessons]
 
+    failed = []
     for lesson in sorted(todo, key=lambda x: x.order):
+      try:
         field, hib = LESSON_SELECTOR[lesson.cid]
         if field not in pool.columns:
             print(f"[{lesson.cid}] 缺欄位 {field}，跳過")
@@ -196,8 +208,15 @@ def main():
         lc.save_json(index, os.path.join(outdir, "index.json"))
         print(f"[{lesson.cid}] {lesson.name}：正例 {len(index['positive'])} 張 / "
               f"反例 {len(index['negative'])} 張 + 速查卡")
+      except Exception as e:
+        import traceback
+        failed.append((lesson.cid, repr(e)))
+        print(f"[{lesson.cid}] {lesson.name} 失敗：{e}")
+        traceback.print_exc(limit=3)
 
-    print("完成。")
+    print(f"完成。成功 {len(todo) - len(failed)} 課，失敗 {len(failed)} 課。")
+    for cid, msg in failed:
+        print(f"  ✗ {cid}: {msg}")
 
 
 if __name__ == "__main__":
