@@ -2,34 +2,47 @@ r"""
 每日增量（還原股價版）：更新 data/adj/prices_adj_YYYY.parquet
 
 為什麼不能直接把交易所的收盤價 append 進去：
-  TWSE/TPEx OpenAPI 給的是「未還原」價格。除息當天股價會跳空下跌一個
-  股利的幅度——那不是真的跌，但 append 進還原序列後會製造假跌幅，
-  污染 30 週均線、52 週低點、RS、以及「爆量最大跌勢」這個賣訊。
+    TWSE/TPEx OpenAPI 給的是「未還原」價格。除息當天股價會跳空下跌一個
+    股利的幅度——那不是真的跌，但 append 進還原序列後會製造假跌幅，
+    污染 30 週均線、52 週低點、RS、以及「爆量最大跌勢」這個賣訊。
 
 做法：
-  1. 抓當日除權息（FinMind TaiwanStockDividendResult，免費層）
-  2. 有除息的股票：把它在 data/adj/ 裡的「歷史」價格乘上 after/before，
-     讓舊價格往下對齊新的價格水準
-  3. 再 append 當日的未還原收盤價（它本身就是新水準的價格，不用調）
+    1. 抓當日除權息（FinMind TaiwanStockDividendResult，免費層）
+    2. 有除息的股票：把它在 data/adj/ 裡的「歷史」價格乘上 after/before，
+       讓舊價格往下對齊新的價格水準
+    3. 再 append 當日的未還原收盤價（它本身就是新水準的價格，不用調）
 
-這樣做的等價說法：因子錨定在「最新價格」，歷史價格隨每次除息往下調。
-跟券商軟體的還原線圖一致，今天的收盤數字永遠等於實際成交價。
+    這樣做的等價說法：因子錨定在「最新價格」，歷史價格隨每次除息往下調。
+    跟券商軟體的還原線圖一致，今天的收盤數字永遠等於實際成交價。
 
 母體用 data/universe.parquet 當白名單，不用 regex：
-  舊版用 r"^[1-9]\d{3}$"（首位 1-9 且剛好四位），這條把 487 檔全部濾掉——
-  所有 00 開頭的 ETF（0050、00878）、帶字母的（00981T、00679B）、
-  六位數的（006208）。回補用的是 FinMind 批次端點沒有這條，所以歷史是完整的，
-  是每日增量把它們切掉，導致那 487 檔從 2026-08-31 起靜默停止更新。
-  universe 有 3,141 檔且不含權證（六位數只有 400 檔），拿來當白名單剛好。
+    舊版用 r"^[1-9]\d{3}$"（首位 1-9 且剛好四位），這條把 487 檔全部濾掉——
+    所有 00 開頭的 ETF（0050、00878）、帶字母的（00981T、00679B）、
+    六位數的（006208）。回補用的是 FinMind 批次端點沒有這條，所以歷史是完整的，
+    是每日增量把它們切掉，導致那 487 檔從 2026-08-31 起靜默停止更新。
+    universe 有 3,141 檔且不含權證（六位數只有 400 檔），拿來當白名單剛好。
 
 當日資料已存在時會「補缺」而不是整批跳過：
-  這樣上面那種漏檔可以靠重跑修復。補缺時不會重新套除權息，
-  因為歷史價格在同一天的第一次執行就已經調過了，再調一次會變成雙重調整。
+    這樣上面那種漏檔可以靠重跑修復。補缺時不會重新套除權息，
+    因為歷史價格在同一天的第一次執行就已經調過了，再調一次會變成雙重調整。
+
+2026-09-07 新增 FinMind 備援：
+    TWSE 的 STOCK_DAY_ALL 端點沒有日期欄位，腳本是拿 TPEx 回報的日期當作當日
+    日期。所以 TWSE 回前一交易日的資料時，程式完全無從察覺——8/31、9/2、9/7
+    都是這樣（重複率 57%、58%、58%，剛好等於 TWSE 那 1380 檔佔比）。
+    以前的處理是中止不寫，資料是保住了但那一天就是缺的，要人工補。
+    現在改成：重複率超標時轉去抓 FinMind 的 TaiwanStockPrice（不帶 stock_id
+    就會回整個市場當天所有股票，一次呼叫，不是一檔一檔打），用它取代交易所
+    資料。FinMind 有 date 欄位，可以直接驗證拿到的是不是要的那一天。
+    FinMind 的資料一樣要過重複率檢查，還是超標才中止——不然只是換一個來源
+    繼續汙染。
 
 用法：
     FINMIND_TOKEN=xxx python scripts/daily_update_adj.py
     FINMIND_TOKEN=xxx python scripts/daily_update_adj.py --dry-run
+    FINMIND_TOKEN=xxx python scripts/daily_update_adj.py --source finmind
 """
+
 import argparse
 import datetime as dt
 import glob
@@ -43,11 +56,14 @@ import requests
 TWSE = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 TPEX = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
 FINMIND = "https://api.finmindtrade.com/api/v4/data"
+
 DATA_DIR = "data/adj"
 UNIVERSE = "data/universe.parquet"
+
 # universe.parquet 讀不到時的退路。刻意放寬到「4-6 位數字 + 可選一個大寫字母」，
 # 寧可多收也不要再靜默漏掉 ETF；真有雜訊會在下面的母體檢查印出來。
 FALLBACK_RE = r"^\d{4,6}[A-Z]?$"
+
 COLS = ["date", "stock_id", "open", "max", "min", "close",
         "Trading_Volume", "Trading_money"]
 
@@ -73,7 +89,6 @@ def pick(df, *names):
 def roc_to_iso(s: str) -> str:
     s = str(s).strip().replace("/", "")
     return f"{int(s[:3]) + 1911:04d}-{s[3:5]}-{s[5:7]}"
-
 
 
 def _get(url: str, timeout: int = 60, tries: int = 4, **kw):
@@ -143,6 +158,59 @@ def fetch_tpex():
     return out, date
 
 
+def fetch_finmind_day(day: str) -> pd.DataFrame:
+    """FinMind 全市場單日行情（備援來源）。
+
+    TaiwanStockPrice 不帶 stock_id 時會回傳該日期區間內所有股票，一次呼叫就
+    拿到整個市場——不是一檔打一次，所以免費層的配額完全夠用。
+    回傳的欄位名稱本來就跟 COLS 一致（date / stock_id / open / max / min /
+    close / Trading_Volume / Trading_money），不用改名。
+
+    有 date 欄位是關鍵：可以直接驗證拿到的是不是指定的那一天，而 TWSE 的
+    端點沒有這個欄位，這正是它回舊資料時察覺不到的原因。
+    """
+    tok = os.environ.get("FINMIND_TOKEN", "").strip()
+    if not tok:
+        print("  FinMind 備援不可用：沒有 FINMIND_TOKEN")
+        return pd.DataFrame()
+    try:
+        r = requests.get(FINMIND,
+                         params={"dataset": "TaiwanStockPrice",
+                                 "start_date": day, "end_date": day},
+                         headers={"Authorization": f"Bearer {tok}"},
+                         timeout=180)
+        if r.status_code != 200:
+            print(f"  FinMind 備援失敗：HTTP {r.status_code} {r.text[:200]}")
+            return pd.DataFrame()
+        data = r.json().get("data", [])
+    except Exception as e:
+        print(f"  FinMind 備援失敗：{type(e).__name__} {e}")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data)
+    if df.empty:
+        print(f"  FinMind 回傳 0 筆（{day} 可能還沒入庫，或不是交易日）")
+        return df
+
+    # 驗日期：FinMind 有 date 欄位，回來的必須就是要的那一天
+    got = sorted(set(df["date"].astype(str).str.slice(0, 10)))
+    if got != [day]:
+        print(f"  FinMind 回傳的日期是 {got[:3]}，不是 {day}，不採用")
+        return pd.DataFrame()
+
+    out = pd.DataFrame({
+        "stock_id": df["stock_id"].astype(str).str.strip(),
+        "open": num(pick(df, "open")),
+        "max": num(pick(df, "max")),
+        "min": num(pick(df, "min")),
+        "close": num(pick(df, "close")),
+        "Trading_Volume": num(pick(df, "Trading_Volume")),
+        "Trading_money": num(pick(df, "Trading_money")),
+    })
+    print(f"  FinMind 回傳 {len(out)} 筆（{day}）")
+    return out
+
+
 def fetch_dividends(day: str) -> pd.DataFrame:
     """當日除權息。免費層拿得到，而且直接給 before_price / after_price，
     不用自己從現金股利、股票股利、增資配股三種情況拆開算。"""
@@ -197,11 +265,12 @@ def apply_dividends(div: pd.DataFrame) -> int:
     d["after_price"] = pd.to_numeric(d["after_price"], errors="coerce")
     d = d[(d["before_price"] > 0) & (d["after_price"] > 0)]
     d["ratio"] = d["after_price"] / d["before_price"]
+
     bad = (d["ratio"] < RATIO_LO) | (d["ratio"] > RATIO_HI)
     if bad.any():
         print(f"  跳過 {int(bad.sum())} 筆異常比值："
               f"{d[bad]['stock_id'].tolist()[:10]}")
-        d = d[~bad]
+    d = d[~bad]
     if d.empty:
         return 0
 
@@ -225,7 +294,6 @@ def apply_dividends(div: pd.DataFrame) -> int:
     return touched
 
 
-
 def norm_date(s):
     """把 date 欄位統一成 'YYYY-MM-DD' 字串。
 
@@ -245,7 +313,7 @@ def norm_date(s):
 
 # 寫入前要跟上一個交易日比對的欄位。全部相同 = 那一列根本沒動過。
 DUP_COLS = ["open", "max", "min", "close", "Trading_Volume"]
-DUP_LIMIT = 0.30      # 超過這個比例完全相同就中止
+DUP_LIMIT = 0.30      # 超過這個比例完全相同就判定為 stale
 DUP_MIN_N = 200       # 樣本太少時比例沒有意義，不判
 
 
@@ -281,55 +349,102 @@ def stale_ratio(new: pd.DataFrame, path: str, session_date: str):
     return float(same.mean()), len(ix), prev
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dry-run", action="store_true")
-    args = ap.parse_args()
-
-    if not os.path.isdir(DATA_DIR) or not year_files():
-        sys.exit(f"找不到 {DATA_DIR} 下的年份檔。先跑 backfill_adj.py。")
-
-    tw = fetch_twse()
-    tp, session_date = fetch_tpex()
-    print(f"TWSE {len(tw)} 筆 / TPEx {len(tp)} 筆 / 交易日 {session_date}")
-
-    if not session_date:
-        session_date = dt.date.today().isoformat()
-        print(f"警告：TPEx 沒給日期，改用今天 {session_date}")
-
-    df = pd.concat([tw, tp], ignore_index=True)
+def clean(df: pd.DataFrame, session_date: str, ids: set) -> pd.DataFrame:
+    """白名單過濾 + 去重 + 欄位對齊。交易所來源與 FinMind 來源共用。"""
+    df = df.copy()
     df["date"] = str(session_date)[:10]
     raw_n = len(df)
-
-    ids = allowlist()
     if ids:
         df = df[df["stock_id"].isin(ids)]
         print(f"白名單過濾：{raw_n} → {len(df)}（universe {len(ids)} 檔）")
     else:
         df = df[df["stock_id"].str.match(FALLBACK_RE)]
         print(f"regex 過濾：{raw_n} → {len(df)}")
-
     df = df[df["close"].notna() & (df["close"] > 0)]
     df = df.drop_duplicates(subset=["stock_id"], keep="first")
     df = df.reindex(columns=COLS)
     print(f"清理後 {len(df)} 檔")
+    return df
 
-    if len(df) < 800:
-        sys.exit(f"筆數異常偏少（{len(df)}），可能是休市或 API 改版，不寫入")
 
-    yr_probe = session_date[:4]
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--source", choices=["auto", "exchange", "finmind"],
+                    default="auto",
+                    help="auto=交易所優先、stale 時轉 FinMind（預設）；"
+                         "finmind=直接用 FinMind；exchange=只用交易所，"
+                         "stale 就中止（舊行為）")
+    args = ap.parse_args()
+
+    if not os.path.isdir(DATA_DIR) or not year_files():
+        sys.exit(f"找不到 {DATA_DIR} 下的年份檔。先跑 backfill_adj.py。")
+
+    ids = allowlist()
+    source_used = None
+    df = pd.DataFrame()
+    session_date = None
+
+    # ---------------- 交易所來源 ----------------
+    if args.source in ("auto", "exchange"):
+        tw = fetch_twse()
+        tp, session_date = fetch_tpex()
+        print(f"TWSE {len(tw)} 筆 / TPEx {len(tp)} 筆 / 交易日 {session_date}")
+
+        if not session_date:
+            session_date = dt.date.today().isoformat()
+            print(f"警告：TPEx 沒給日期，改用今天 {session_date}")
+
+        df = clean(pd.concat([tw, tp], ignore_index=True), session_date, ids)
+        source_used = "exchange"
+    else:
+        session_date = dt.date.today().isoformat()
+
+    yr_probe = str(session_date)[:4]
     probe_path = os.path.join(DATA_DIR, f"prices_adj_{yr_probe}.parquet")
-    dup, dup_n, prev_day = stale_ratio(df, probe_path, session_date)
-    if dup_n:
-        print(f"與上一交易日（{prev_day}）比對 {dup_n} 檔，"
-              f"OHLCV 完全相同 {dup:.0%}")
-    if dup >= DUP_LIMIT:
-        sys.exit(
-            f"中止：{dup:.0%} 的股票與 {prev_day} 完全相同（門檻 {DUP_LIMIT:.0%}）。"
-            f"多半是來源還沒更新當日資料，寫進去會用舊價汙染 {session_date}。"
-            f"稍後再跑一次；若持續發生，檢查 TWSE / TPEx 端點的發布時間。")
 
-    yr = session_date[:4]
+    need_fallback = (args.source == "finmind")
+    if source_used == "exchange":
+        if len(df) < 800:
+            print(f"交易所來源筆數異常偏少（{len(df)}）")
+            need_fallback = True
+        else:
+            dup, dup_n, prev_day = stale_ratio(df, probe_path, session_date)
+            if dup_n:
+                print(f"與上一交易日（{prev_day}）比對 {dup_n} 檔，"
+                      f"OHLCV 完全相同 {dup:.0%}")
+            if dup >= DUP_LIMIT:
+                if args.source == "exchange":
+                    sys.exit(
+                        f"中止：{dup:.0%} 的股票與 {prev_day} 完全相同"
+                        f"（門檻 {DUP_LIMIT:.0%}）。--source exchange 不啟用備援。")
+                print(f"交易所資料判定為 stale（{dup:.0%}），轉用 FinMind 備援")
+                need_fallback = True
+
+    # ---------------- FinMind 備援 ----------------
+    if need_fallback:
+        fm = fetch_finmind_day(session_date)
+        if fm.empty:
+            sys.exit(
+                f"中止：交易所資料 stale，FinMind 備援也拿不到 {session_date} 的資料。"
+                f"稍後再跑一次；FinMind 通常在收盤後 1-2 小時才入庫。")
+        fm = clean(fm, session_date, ids)
+        if len(fm) < 800:
+            sys.exit(f"中止：FinMind 只有 {len(fm)} 檔，不足以寫入")
+        dup, dup_n, prev_day = stale_ratio(fm, probe_path, session_date)
+        if dup_n:
+            print(f"[FinMind] 與上一交易日（{prev_day}）比對 {dup_n} 檔，"
+                  f"OHLCV 完全相同 {dup:.0%}")
+        if dup >= DUP_LIMIT:
+            sys.exit(
+                f"中止：FinMind 的資料同樣有 {dup:.0%} 與 {prev_day} 完全相同"
+                f"（門檻 {DUP_LIMIT:.0%}）。兩個來源都還沒更新，稍後再跑。")
+        df = fm
+        source_used = "finmind"
+
+    print(f"採用來源：{source_used}")
+
+    yr = str(session_date)[:4]
     path = os.path.join(DATA_DIR, f"prices_adj_{yr}.parquet")
 
     # 已有多少當日資料？決定是「新的一天」還是「補缺」。
@@ -351,7 +466,8 @@ def main():
 
     if args.dry_run:
         div = fetch_dividends(session_date)
-        print(f"[dry-run] 當日除權息 {len(div)} 筆")
+        print(f"[dry-run] 來源 {source_used}／當日 {len(df)} 檔／"
+              f"除權息 {len(div)} 筆")
         if not div.empty:
             print(div.head(10).to_string(index=False))
         return
@@ -368,18 +484,21 @@ def main():
 
     if os.path.exists(path):
         df = pd.concat([pd.read_parquet(path), df], ignore_index=True)
+
     df["date"] = norm_date(df["date"])
     bad = ~df["date"].str.match(r"^\d{4}-\d{2}-\d{2}$")
     if bad.any():
         sys.exit(f"中止：{int(bad.sum())} 列的 date 不是 YYYY-MM-DD，"
                  f"例如 {df.loc[bad, 'date'].head(3).tolist()}。不寫入。")
+
     df = df.drop_duplicates(subset=["stock_id", "date"], keep="last")
     df = df.sort_values(["stock_id", "date"]).reset_index(drop=True)
     df.to_parquet(path, index=False, compression="zstd")
+
     today_n = int((df["date"] == session_date).sum())
     print(f"已寫入 {os.path.basename(path)}：{df['stock_id'].nunique()} 檔 / "
           f"{len(df):,} 列 / {os.path.getsize(path) / 1e6:.1f} MB")
-    print(f"{session_date} 當日 {today_n} 檔")
+    print(f"{session_date} 當日 {today_n} 檔（來源 {source_used}）")
 
     # 跟前一個交易日比對。少 10% 以上通常代表來源改版或又被濾掉一批，
     # 這種事不會報錯只會靜默累積，所以一定要印出來。
