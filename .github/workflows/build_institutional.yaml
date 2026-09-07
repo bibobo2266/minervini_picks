@@ -1,0 +1,52 @@
+name: build_institutional
+
+on:
+  workflow_dispatch:
+    inputs:
+      parts:
+        description: "要抓哪幾塊（stock,total,futures）"
+        default: "total,futures"
+      start:
+        description: "起始日"
+        default: "2015-06-01"
+      end:
+        description: "結束日（空白=今天）"
+        default: ""
+      sleep:
+        description: "每次請求間隔秒數"
+        default: "0.6"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install pandas pyarrow requests
+
+      - name: 抓取三大法人
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+        run: |
+          python scripts/build_institutional.py \
+            --parts "${{ inputs.parts }}" \
+            --start "${{ inputs.start }}" \
+            --end "${{ inputs.end }}" \
+            --sleep "${{ inputs.sleep }}"
+
+      - name: Commit
+        if: always()
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add data/inst || true
+          git commit -m "inst: ${{ inputs.parts }} ${{ inputs.start }}~${{ inputs.end }}" || echo "無變更"
+          git push || true
