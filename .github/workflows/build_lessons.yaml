@@ -1,0 +1,51 @@
+name: build_lessons
+
+on:
+  workflow_dispatch:
+    inputs:
+      lessons:
+        description: '只做哪幾課（空白＝全部），例如：C03 C01'
+        required: false
+        default: ''
+      n:
+        description: '每課正例／反例各幾張'
+        required: false
+        default: '10'
+      rebuild_pool:
+        description: '重算突破事件池（第一次或資料更新後要打 true）'
+        required: false
+        default: 'true'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install pandas numpy pyarrow matplotlib
+
+      - name: 產生教材圖
+        run: |
+          ARGS=""
+          if [ -n "${{ github.event.inputs.lessons }}" ]; then
+            ARGS="$ARGS --lessons ${{ github.event.inputs.lessons }}"
+          fi
+          if [ "${{ github.event.inputs.rebuild_pool }}" = "true" ]; then
+            ARGS="$ARGS --rebuild-pool"
+          fi
+          python scripts/build_lesson_assets.py --n ${{ github.event.inputs.n }} $ARGS
+
+      - name: Commit
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add assets/lessons
+          git diff --staged --quiet || git commit -m "chore: rebuild lesson assets"
+          git push
