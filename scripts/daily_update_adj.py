@@ -219,10 +219,28 @@ def apply_dividends(div: pd.DataFrame) -> int:
         f = g.loc[m, "stock_id"].map(ratios).astype(float)
         for c in ["open", "max", "min", "close"]:
             g.loc[m, c] = (g.loc[m, c] * f).round(4)
+        g["date"] = norm_date(g["date"])   # 順手把舊檔的日期格式收斂掉
         g.to_parquet(path, index=False, compression="zstd")
         touched += int(m.sum())
     return touched
 
+
+
+def norm_date(s):
+    """把 date 欄位統一成 'YYYY-MM-DD' 字串。
+
+    ⚠️ 這是 2026-09 事故的根因修正。
+    原本寫入路徑是 df["date"] = df["date"].astype(str)：
+    既有 parquet 若是 datetime64，astype(str) 會得到 '2026-04-10 00:00:00'，
+    而當日新列是 session_date 的純日期 '2026-09-04'——同一欄兩種格式。
+    下游任何 pd.to_datetime() 都會用第一列推格式，撞到第二種就 ValueError
+    （build_institutional.py 的 trading_days 就是這樣掛的）。
+    這裡先轉字串再切前 10 碼，不做任何格式推斷，兩種輸入都收斂到同一形狀。
+    因為每次寫檔都會重寫整個年份檔，既有的混合格式檔案跑一次就自動修好。
+    """
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return s.dt.strftime("%Y-%m-%d")
+    return s.astype(str).str.slice(0, 10)
 
 
 # 寫入前要跟上一個交易日比對的欄位。全部相同 = 那一列根本沒動過。
@@ -248,7 +266,7 @@ def stale_ratio(new: pd.DataFrame, path: str, session_date: str):
     except Exception as e:
         print(f"警告：讀不到既有檔案做比對（{e}），跳過重複檢查")
         return 0.0, 0, None
-    old["date"] = old["date"].astype(str)
+    old["date"] = norm_date(old["date"])
     prev_days = sorted(d for d in old["date"].unique() if d < session_date)
     if not prev_days:
         return 0.0, 0, None
@@ -280,7 +298,7 @@ def main():
         print(f"警告：TPEx 沒給日期，改用今天 {session_date}")
 
     df = pd.concat([tw, tp], ignore_index=True)
-    df["date"] = session_date
+    df["date"] = str(session_date)[:10]
     raw_n = len(df)
 
     ids = allowlist()
@@ -319,8 +337,8 @@ def main():
     existing_ids, is_repair = set(), False
     if os.path.exists(path):
         old = pd.read_parquet(path, columns=["date", "stock_id"])
-        existing_ids = set(old.loc[old["date"].astype(str) == session_date,
-                                   "stock_id"])
+        old["date"] = norm_date(old["date"])
+        existing_ids = set(old.loc[old["date"] == session_date, "stock_id"])
         if existing_ids:
             is_repair = True
             miss = df[~df["stock_id"].isin(existing_ids)]
@@ -350,7 +368,11 @@ def main():
 
     if os.path.exists(path):
         df = pd.concat([pd.read_parquet(path), df], ignore_index=True)
-    df["date"] = df["date"].astype(str)
+    df["date"] = norm_date(df["date"])
+    bad = ~df["date"].str.match(r"^\d{4}-\d{2}-\d{2}$")
+    if bad.any():
+        sys.exit(f"中止：{int(bad.sum())} 列的 date 不是 YYYY-MM-DD，"
+                 f"例如 {df.loc[bad, 'date'].head(3).tolist()}。不寫入。")
     df = df.drop_duplicates(subset=["stock_id", "date"], keep="last")
     df = df.sort_values(["stock_id", "date"]).reset_index(drop=True)
     df.to_parquet(path, index=False, compression="zstd")
@@ -361,7 +383,7 @@ def main():
 
     # 跟前一個交易日比對。少 10% 以上通常代表來源改版或又被濾掉一批，
     # 這種事不會報錯只會靜默累積，所以一定要印出來。
-    days = sorted(set(df["date"].astype(str)))
+    days = sorted(set(df["date"]))
     if len(days) >= 2:
         prev = days[-2]
         prev_n = int((df["date"] == prev).sum())

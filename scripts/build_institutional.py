@@ -79,6 +79,20 @@ def api_get(dataset, start_date, end_date=None, data_id=None, sleep=0.6):
 
 # ---------- 交易日 ----------
 
+def to_iso_days(s):
+    """把任意 date 欄位轉成 'YYYY-MM-DD' 字串序列。
+
+    ⚠️ data/adj 的 date 欄位型別不一致：2015-2025 是 datetime64[ns]，
+    2026 是 str，而且 str 內部還混了 '2026-04-10 00:00:00' 與 '2026-09-04'
+    兩種格式（daily_update_adj.py 直接寫純字串造成）。
+    pd.to_datetime 會用第一列推格式，撞到第二種就 ValueError。
+    所以這裡一律先轉字串、只取前 10 碼，不做格式推斷。
+    """
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return s.dt.strftime("%Y-%m-%d")
+    return s.astype(str).str.slice(0, 10)
+
+
 def trading_days(start, end):
     files = sorted(ADJ_DIR.glob("prices_adj_*.parquet"))
     if not files:
@@ -86,8 +100,8 @@ def trading_days(start, end):
     days = set()
     for f in files:
         d = pd.read_parquet(f, columns=["date"])["date"]
-        days.update(pd.to_datetime(d).dt.strftime("%Y-%m-%d").unique())
-    days = sorted(d for d in days if start <= d <= end)
+        days.update(to_iso_days(d).unique())
+    days = sorted(d for d in days if start <= d <= end and len(d) == 10)
     return days
 
 
@@ -121,6 +135,9 @@ def load_year(year):
 
 
 def save_year(year, df):
+    # 統一存成 'YYYY-MM-DD' 字串，避免這支自己再製造混合格式的 date 欄位
+    df = df.copy()
+    df["date"] = to_iso_days(df["date"])
     df = df.drop_duplicates(subset=["date", "stock_id"], keep="last")
     df = df.sort_values(["date", "stock_id"]).reset_index(drop=True)
     df.to_parquet(OUT_DIR / f"stock_inst_{year}.parquet", index=False)
@@ -136,7 +153,7 @@ def run_stock(start, end, sleep, flush_every=20):
         df = load_year(y)
         by_year[y] = df
         if not df.empty:
-            done |= set(pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d"))
+            done |= set(to_iso_days(df["date"]))
 
     todo = [d for d in days if d not in done]
     print(f"[個股] 已有 {len(days) - len(todo)} 天，待抓 {len(todo)} 天")
