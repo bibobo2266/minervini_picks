@@ -12,14 +12,22 @@ on:
         required: false
         default: '10'
       rebuild_pool:
-        description: '重算突破事件池（第一次或資料更新後要打 true）'
+        description: '重算突破事件池（第一次或還原股價更新後要打 true）'
         required: false
         default: 'true'
+      questions:
+        description: 'HTML 練習檔每課幾題（0 = 不產生 HTML）'
+        required: false
+        default: '20'
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
+
     steps:
       - uses: actions/checkout@v4
         with:
@@ -29,9 +37,17 @@ jobs:
         with:
           python-version: '3.12'
 
-      - run: pip install pandas numpy pyarrow matplotlib
+      - name: 安裝套件
+        run: pip install pandas numpy pyarrow matplotlib
 
-      - name: 產生教材圖
+      - name: 檢查資料與字型
+        run: |
+          echo "--- 還原股價 ---"
+          ls -la data/adj/ 2>/dev/null | head -20 || echo "!! 找不到 data/adj/"
+          echo "--- 字型 ---"
+          ls -la fonts/ 2>/dev/null || echo "!! 找不到 fonts/（中文會變豆腐字）"
+
+      - name: 產生教材圖與速查卡
         run: |
           ARGS=""
           if [ -n "${{ github.event.inputs.lessons }}" ]; then
@@ -42,7 +58,43 @@ jobs:
           fi
           python scripts/build_lesson_assets.py --n ${{ github.event.inputs.n }} $ARGS
 
-      - name: Commit
+      - name: 產生 HTML 練習檔
+        if: ${{ github.event.inputs.questions != '0' }}
+        run: |
+          ARGS=""
+          if [ -n "${{ github.event.inputs.lessons }}" ]; then
+            ARGS="--lessons ${{ github.event.inputs.lessons }}"
+          fi
+          python scripts/build_lesson_html.py --questions ${{ github.event.inputs.questions }} $ARGS
+
+      - name: 檢查產出
+        if: always()
+        run: |
+          echo "=== assets/lessons ==="
+          find assets/lessons -type f 2>/dev/null | head -40
+          echo "PNG 張數：$(find assets/lessons -name '*.png' 2>/dev/null | wc -l)"
+          echo "=== lessons_html ==="
+          ls -la lessons_html/ 2>/dev/null || echo "（沒有 HTML 產出）"
+
+      - name: 上傳 HTML 練習檔（從 Actions 頁面下載）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lessons-html
+          path: lessons_html/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: 上傳教材圖備份
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lesson-assets
+          path: assets/lessons/
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Commit 教材圖回 repo
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
