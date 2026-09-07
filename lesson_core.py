@@ -37,6 +37,30 @@ LOOKBACK_HIGH = 250         # 250 日新高
 
 TAIEX_CANDIDATES = ["TAIEX", "Y9999", "^TWII", "TWII"]
 
+# 教材母體過濾
+MIN_HISTORY_DAYS = 400        # 突破日前至少要有這麼多交易日，否則型態判讀沒有依據
+EXCLUDE_SUFFIX = ("B", "L", "R", "U")   # 債券 / 槓桿 / 反向 / 期信
+
+
+def is_teachable_symbol(sid: str) -> bool:
+    """能不能拿來當看盤教材。
+
+    保留：普通股（2330、6415…）與股票型 ETF（0050、0056、006208…）
+    排除：債券 ETF（00679B）、槓桿（00631L）、反向（00632R）、期信（00635U）、
+          以及權證、TDR 等非四～六碼代號。
+    債券 ETF 一天波動 0.2%，任何「振幅」類指標都會被它們洗版，但它們沒有籌碼結構，
+    型態不可轉移到個股，所以不能當教材。
+    """
+    sid = str(sid).strip().upper()
+    if sid in TAIEX_CANDIDATES:
+        return False
+    if not sid[:1].isdigit():
+        return False
+    if sid.endswith(EXCLUDE_SUFFIX):
+        return False
+    # 只留純數字代號：普通股與股票型 ETF。特別股（2891B）、DR、權證等一律排除。
+    return sid.isdigit() and 4 <= len(sid) <= 6
+
 
 # ----------------------------------------------------------------------------
 # 中文字型
@@ -150,6 +174,8 @@ def find_breakouts(g: pd.DataFrame) -> pd.DataFrame:
     # 同一波只取第一根（20 日內不重複計）
     kept, last = [], -999
     for i in idx:
+        if i < MIN_HISTORY_DAYS:      # 前面歷史太短，型態沒有依據
+            continue
         if i - last > 20:
             kept.append(i)
             last = i
