@@ -46,8 +46,10 @@ def _f(v, spec="{:.2f}"):
 
 def build_pool(df: pd.DataFrame, taiex, min_events_per_stock: int = 0) -> pd.DataFrame:
     rows = []
-    ids = [s for s in df["stock_id"].astype(str).unique()
-           if s not in lc.TAIEX_CANDIDATES]
+    all_ids = df["stock_id"].astype(str).unique()
+    ids = [s for s in all_ids if lc.is_teachable_symbol(s)]
+    print(f"母體過濾：{len(all_ids)} 檔 → {len(ids)} 檔"
+          f"（排除債券/槓桿/反向/期信 ETF 與非普通股）")
     for n, sid in enumerate(ids, 1):
         g = df[df["stock_id"].astype(str) == sid].sort_values("date").reset_index(drop=True)
         bo = lc.find_breakouts(g)
@@ -74,15 +76,30 @@ def build_pool(df: pd.DataFrame, taiex, min_events_per_stock: int = 0) -> pd.Dat
     return pool
 
 
-def pick_examples(pool: pd.DataFrame, field: str, higher_is_better: bool, n: int):
-    """挑正例與反例。刻意避開同一檔重複，讓教材看起來不像同一支股票。"""
+def pick_examples(pool: pd.DataFrame, field: str, higher_is_better: bool, n: int,
+                  seed: int = 0):
+    """挑正例與反例。
+
+    不取最極端的前 N 名 —— 那樣挑到的是資料庫裡的異類（債券 ETF、剛上市的怪股），
+    學了也用不上。改成在「前 20% 分位帶」裡隨機抽，讓教材看起來像你以後
+    真的會在盤面上遇到的股票。
+    """
     sub = pool.dropna(subset=[field]).copy()
+    sub = sub[sub["stock_id"].astype(str).map(lc.is_teachable_symbol)]
     if sub.empty:
         return sub, sub
-    sub = sub.sort_values(field, ascending=not higher_is_better)
-    pos = sub.drop_duplicates("stock_id").head(n)
-    neg = sub.iloc[::-1].drop_duplicates("stock_id").head(n)
-    return pos, neg
+
+    q_hi, q_lo = sub[field].quantile(0.80), sub[field].quantile(0.20)
+    band_hi = sub[sub[field] >= q_hi]
+    band_lo = sub[sub[field] <= q_lo]
+    good, bad = (band_hi, band_lo) if higher_is_better else (band_lo, band_hi)
+
+    def take(part):
+        part = part.drop_duplicates("stock_id")
+        k = min(n, len(part))
+        return part.sample(k, random_state=seed) if k else part
+
+    return take(good), take(bad)
 
 
 def draw_cheatsheet(lesson: lc.Lesson, outpath: str):
@@ -139,6 +156,7 @@ def main():
     ap.add_argument("--n", type=int, default=10, help="每課正例／反例各幾張")
     ap.add_argument("--years", nargs="*", type=int, default=None)
     ap.add_argument("--rebuild-pool", action="store_true")
+    ap.add_argument("--seed", type=int, default=0, help="換一批教材圖就改這個數字")
     args = ap.parse_args()
 
     font = lc.setup_font()
@@ -175,7 +193,7 @@ def main():
         outdir = os.path.join(lc.ASSET_DIR, lesson.cid)
         os.makedirs(outdir, exist_ok=True)
 
-        pos, neg = pick_examples(pool, field, hib, args.n)
+        pos, neg = pick_examples(pool, field, hib, args.n, seed=args.seed)
         index = {"cid": lesson.cid, "name": lesson.name, "order": lesson.order,
                  "selector_field": field, "positive": [], "negative": []}
 

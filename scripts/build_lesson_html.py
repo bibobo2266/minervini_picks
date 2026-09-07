@@ -102,8 +102,12 @@ def build_questions(lesson, pool, prices, n, rng):
     if field not in pool.columns:
         raise ValueError(f"pool 沒有欄位 {field}")
     sub = pool.dropna(subset=[field]).copy()
+    before = len(sub)
+    sub = sub[sub["stock_id"].astype(str).map(lc.is_teachable_symbol)]
     if sub.empty:
-        raise ValueError(f"欄位 {field} 全部是空值（C06 需要加權指數資料）")
+        raise ValueError(
+            f"欄位 {field} 過濾後沒有樣本（原本 {before} 筆；"
+            f"C06 需要加權指數資料）")
 
     med = float(sub[field].median())
     # 兩端各抽一半，避免全是模糊題；不足時放寬
