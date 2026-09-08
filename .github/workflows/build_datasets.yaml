@@ -1,0 +1,106 @@
+name: build_datasets
+
+on:
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "要抓哪些（逗號分隔，空白=全部）：balance_sheet,stock_per,futures_tx,index_taiex,index_tri"
+        default: "balance_sheet,stock_per"
+      start:
+        description: "起始日"
+        default: "2015-06-01"
+      end:
+        description: "結束日（空白=今天）"
+        default: ""
+      sleep:
+        description: "每次請求間隔秒數（per_stock 模式請給 6 以上，免費層每小時 600 次）"
+        default: "6"
+      probe_only:
+        description: "只探測不抓資料（true/false）"
+        default: "true"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: datasets-write
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # per_stock 模式約 2,000 檔 × 6s ≈ 3.5 小時，所以放到 360
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install "pandas<3" pyarrow requests
+
+      - name: 抓取
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+        run: |
+          EXTRA=""
+          if [ "${{ inputs.probe_only }}" = "true" ]; then EXTRA="--probe-only"; fi
+          python scripts/build_datasets.py \
+            --only "${{ inputs.only }}" \
+            --start "${{ inputs.start }}" \
+            --end "${{ inputs.end }}" \
+            --sleep "${{ inputs.sleep }}" \
+            $EXTRA
+
+      # 同 build_institutional.yaml：產出先脫離 git，對齊最新 main 再推，
+      # 失敗重試五次，五次都失敗就 exit 1（不再用 `git push || true` 靜默吞掉）
+      - name: Commit
+        if: always()
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+
+          DIRS=""
+          for d in data/fundamentals data/futures; do
+            if [ -d "$d" ]; then DIRS="$DIRS $d"; fi
+          done
+          if [ -z "$DIRS" ]; then
+            echo "沒有產出目錄，無產出可推"
+            exit 0
+          fi
+
+          rm -rf /tmp/out && mkdir -p /tmp/out
+          for d in $DIRS; do
+            mkdir -p "/tmp/out/$d"
+            cp -a "$d/." "/tmp/out/$d/"
+          done
+          echo "暫存目錄：$DIRS"
+
+          for i in 1 2 3 4 5; do
+            git fetch --depth=1 origin main
+            git checkout -q -f -B main FETCH_HEAD
+            for d in $DIRS; do
+              mkdir -p "$d"
+              cp -a "/tmp/out/$d/." "$d/"
+              git add -A "$d"
+            done
+
+            if git diff --cached --quiet; then
+              echo "無變更"
+              exit 0
+            fi
+
+            git commit -q -m "datasets: ${{ inputs.only }} ${{ inputs.start }}~${{ inputs.end }}"
+            if git push origin main; then
+              echo "推送成功（第 $i 次嘗試）"
+              git log -1 --stat
+              exit 0
+            fi
+            echo "push 第 $i 次失敗，20 秒後重試"
+            sleep 20
+          done
+
+          echo "::error::push 連續 5 次失敗，產出會隨 runner 消失，必須重跑"
+          exit 1
