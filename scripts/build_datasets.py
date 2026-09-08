@@ -1,27 +1,30 @@
 #!/usr/bin/env python3
-"""FinMind 原料回補 —— 母體建置（股本／PBR）＋ basis A 段（期貨／指數）
+"""FinMind 原料回補 —— 母體建置（市值／PBR）＋ basis A 段（期貨／指數）
 
 輸出：
-  data/fundamentals/balance_sheet.parquet   資產負債表（取股本 → 反推股數）
+  data/fundamentals/market_value.parquet    個股市值（分層母體用）
   data/fundamentals/stock_per.parquet       個股 PER / PBR / 殖利率
+  data/fundamentals/balance_sheet.parquet   資產負債表（選配，非必要）
   data/futures/futures_tx.parquet           TX 大台日成交，各契約月份分開
   data/futures/index_taiex.parquet          加權指數（價格指數）
   data/futures/index_tri.parquet            發行量加權報酬指數（含息）
 
---- 優先序 ---
-balance_sheet 是現在唯一的 blocker：沒有乾淨的股數，六格市值母體就切不出來。
-先跑 `--only balance_sheet,stock_per`，期貨那三個可以晚幾天再說。
+--- 優先序：market_value 第一 ---
+2026-09-08 probe 確認 TaiwanStockMarketValue 拿得到（Backer/Sponsor 層）。
+這支隨訂閱到期就會斷，所以先抓它。抓到之後：
+    股數 = market_value / 收盤價
+    股本 ≈ 股數 × 10（台股面額）
+市值分層與「投信淨買超 / 股本」的分母都直接解決，不用碰 EPS 反推。
 
 --- 為什麼不用 EPS 反推股數 ---
 (稅後淨利 − 少數股權) / EPS 在 EPS 接近 0 或為負時分母炸開，股數變無限大或
 負值。傳產循環股與金融股在景氣低點常虧損，等於在低點把它們從母體剔除
-= 自己造出景氣偏誤。改用兩條路：
-  路線 A：股數 = 普通股股本 / 10（台股面額 10 元），季更新、PIT、不會爆
-  路線 B：市值 = PBR × 權益總計（PBR 是證交所每日公布值，本身就是 PIT）
-兩條算出來差超過 5% 的挑出來人工看。
+= 自己造出景氣偏誤。有現成市值表就完全不需要走這條。
 
-TaiwanStockMarketValue（現成市值表）是 Backer/Sponsor 付費，訂閱到期後拿不到，
-所以才要繞這兩條。probe 會順便重測一次，如果哪天又能拿就直接用它。
+--- balance_sheet 為什麼降級 ---
+本來要拿 OrdinaryShare（普通股股本）反推股數，市值表能用之後就不必要了。
+留在 TARGETS 裡是因為 Equity（權益總計）以後做基本面因子可能會用到，
+但它是 per_stock、約 2,000 次呼叫 / 3.3 小時，不要跟其他四支綁在一起跑。
 
 --- 為什麼期貨只抓 TX ---
 MTX（小台）是同一個標的、同一條 basis，抓了只是複製一份重複資料。
@@ -32,16 +35,18 @@ fair basis 要扣股利率。用價格指數（TAIEX）算出來的 basis 會內
 預期缺口；用報酬指數（含息）算則不會。兩個都留著才能交叉驗證 fair value
 模型有沒有算錯——這正是 A 段要驗的東西。
 
+⚠️ 下游注意（probe 讀出來的，寫在這裡免得忘記）：
+  1. futures_tx 有 trading_session 欄，值含 'after_market'（夜盤）。
+     算 basis 只能取日盤，否則跟現貨收盤對不上時間。
+  2. stock_per 的 PER 在虧損股是 0.0，分層一律用 PBR，不要用 PER。
+  3. stock_per / market_value 都含 ETF 與六碼標的，下游要 len(stock_id)==4。
+
 用法：
   python scripts/build_datasets.py --probe-only
-  python scripts/build_datasets.py --only balance_sheet,stock_per --sleep 6
-  python scripts/build_datasets.py --only futures_tx,index_taiex,index_tri
+  python scripts/build_datasets.py --only market_value,stock_per,futures_tx,index_taiex,index_tri
+  python scripts/build_datasets.py --only balance_sheet --sleep 6   # 另外跑，3.3 小時
 可重跑：bulk 模式跳過已完整的年份，per_stock 模式跳過已抓到的 stock_id。
 中斷後直接再跑同一個指令即可續抓。
-
-⚠️ per_stock 模式要打約 2,000 次 API。免費層每小時 600 次，所以 sleep 至少
-給 6 秒，全跑一輪約 3.5 小時。workflow timeout 已設 360 分鐘，且每 50 檔
-落地一次，中斷不會全丟。
 """
 
 import argparse
@@ -61,10 +66,11 @@ ROOT = Path(__file__).resolve().parents[1]
 # mode:
 #   bulk_year  一次拉一整年（date range，帶固定 data_id 或不帶）
 #   auto       probe 時自動判斷能不能 bulk，不行就退回 per_stock
+# 順序即抓取順序：市值表是付費層、隨時可能斷，排第一。
 TARGETS = {
-    "balance_sheet": dict(
-        dataset="TaiwanStockBalanceSheet",
-        out=ROOT / "data" / "fundamentals" / "balance_sheet.parquet",
+    "market_value": dict(
+        dataset="TaiwanStockMarketValue",
+        out=ROOT / "data" / "fundamentals" / "market_value.parquet",
         data_id=None, mode="auto", sample_id="2330",
     ),
     "stock_per": dict(
@@ -87,11 +93,15 @@ TARGETS = {
         out=ROOT / "data" / "futures" / "index_tri.parquet",
         data_id="TAIEX", mode="bulk_year", sample_id="TAIEX",
     ),
+    # 選配，不要跟上面四支一起跑
+    "balance_sheet": dict(
+        dataset="TaiwanStockBalanceSheet",
+        out=ROOT / "data" / "fundamentals" / "balance_sheet.parquet",
+        data_id=None, mode="auto", sample_id="2330",
+    ),
 }
 
-# probe 時額外驗的東西
-TPEX_SAMPLES = ["6488", "3105"]   # 上櫃：環球晶、穩懋 —— 驗 PER 含不含櫃買
-MARKET_VALUE_DATASET = "TaiwanStockMarketValue"   # 付費，順便重測
+TPEX_SAMPLES = ["6488", "3105"]   # 上櫃：環球晶、穩懋
 
 
 # ---------- API ----------
@@ -192,6 +202,7 @@ def probe_target(name, cfg):
         print(f"    ✓ bulk_year，{len(df)} 列")
         print(f"      欄位：{list(df.columns)}")
         print(f"      首列：{df.iloc[0].to_dict()}")
+        _probe_extras(name, df)
         return "bulk_year"
 
     # auto：先試不帶 data_id 的整批日期查詢
@@ -223,17 +234,13 @@ def probe_target(name, cfg):
 
 
 def _probe_extras(name, df):
-    """把明天真正要看的東西直接印出來，省一輪來回。"""
-    if name == "balance_sheet" and "type" in df.columns:
-        print("      --- 科目清單（找股本那一欄叫什麼）---")
-        for t in sorted(df["type"].astype(str).unique()):
-            print(f"        {t}")
-        if "origin_name" in df.columns:
-            cap = df[df["origin_name"].astype(str).str.contains("股本", na=False)]
-            if not cap.empty:
-                print("      --- 名稱含「股本」的列 ---")
-                print(cap[["type", "origin_name", "value"]]
-                      .drop_duplicates().to_string(index=False))
+    """把下游會踩到的東西直接印出來，省一輪來回。"""
+    if name == "balance_sheet" and "origin_name" in df.columns:
+        cap = df[df["origin_name"].astype(str).str.contains("股本", na=False)]
+        if not cap.empty:
+            print("      --- 名稱含「股本」的列 ---")
+            print(cap[["type", "origin_name", "value"]]
+                  .drop_duplicates().to_string(index=False))
 
     if name == "stock_per":
         print("      --- 上櫃覆蓋檢查 ---")
@@ -241,8 +248,12 @@ def _probe_extras(name, df):
             d = api_get("TaiwanStockPER", "2024-01-01", "2024-01-31", sid,
                         fatal_on_level=False)
             got = 0 if d is None or d.empty else len(d)
-            flag = "✓" if got else "✗ 沒有（PER 可能只含上市）"
+            flag = "✓" if got else "✗ 沒有（可能只含上市）"
             print(f"        {sid}: {got} 列 {flag}")
+
+    if name == "futures_tx" and "trading_session" in df.columns:
+        print("      --- trading_session 分佈（算 basis 只能取日盤）---")
+        print(df["trading_session"].value_counts().to_string())
 
 
 def probe():
@@ -250,16 +261,6 @@ def probe():
     modes = {}
     for name, cfg in TARGETS.items():
         modes[name] = probe_target(name, cfg)
-
-    print(f"\n  [付費層重測] {MARKET_VALUE_DATASET}")
-    df = api_get(MARKET_VALUE_DATASET, "2026-07-01", "2026-07-03", "2330",
-                 fatal_on_level=False)
-    if df is None or df.empty:
-        print("    ✗ 拿不到（如預期，Backer/Sponsor 層）→ 走股本反推")
-    else:
-        print(f"    ✓ 意外拿得到！{len(df)} 列，欄位 {list(df.columns)}")
-        print("    → 現成市值表可用，股本反推那套可以整個省掉")
-
     print("\n=== 探測結果 ===")
     for name, m in modes.items():
         print(f"  {name:<14} {m or '不可用'}")
@@ -275,7 +276,11 @@ def save(out_path, df):
     # '2026-09-04' 兩種格式，下游 pd.to_datetime 用第一列推格式就爆。
     df["date"] = df["date"].astype(str).str.slice(0, 10)
     keys = ["date"]
-    for c in ("contract_date", "futures_id", "stock_id", "type"):
+    # balance_sheet 是 long format，同一天同一檔有幾十個科目，
+    # 不把 type 放進鍵會被砍到只剩一列。
+    # futures 同一天同一契約有日盤／夜盤兩列，trading_session 同理。
+    for c in ("contract_date", "trading_session", "futures_id",
+              "stock_id", "type"):
         if c in df.columns:
             keys.append(c)
     df = df.drop_duplicates(subset=keys, keep="last")
@@ -368,7 +373,7 @@ def main():
     ap.add_argument("--end", default="")
     ap.add_argument("--sleep", type=float, default=0.6)
     ap.add_argument("--only", default="",
-                    help="逗號分隔，例：balance_sheet,stock_per")
+                    help="逗號分隔，例：market_value,stock_per")
     ap.add_argument("--probe-only", action="store_true")
     args = ap.parse_args()
 
@@ -405,12 +410,12 @@ def main():
             run_bulk(name, cfg, args.start, end, args.sleep)
 
     print("\n完成")
-    if any(n in usable for n in ("balance_sheet", "stock_per")):
-        print("⚠️ 下一步：股本 → 股數 → 市值分層，兩條路線交叉驗證，"
-              "差超過 5% 的挑出來看。")
+    if "market_value" in usable:
+        print("⚠️ 下一步：股數 = market_value / 收盤價，"
+              "切 LARGE(前33%) / MID(中33%)，逐年檢查各格檔數。")
     if any(n.startswith(("futures", "index")) for n in usable):
-        print("⚠️ 期貨那三個只是 A 段的原料。fair basis 還沒建，"
-              "在 A 段驗過之前不要看 B 段（均值回歸）的績效。")
+        print("⚠️ futures_tx 含夜盤（trading_session='after_market'），"
+              "算 basis 前先濾掉。fair basis 建好前不要看 B 段績效。")
 
 
 if __name__ == "__main__":
