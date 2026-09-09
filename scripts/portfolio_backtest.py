@@ -60,6 +60,9 @@ _AGE = []                  # 突破歷史距離（上次高於現價是幾個交
 _SCORE = []                # 外掛的排序分數矩陣（例如月營收 YoY），--score-file 載入
 _ATR = []                  # ATR20 / 收盤價
 _BREADTH = []              # 母體中收盤價高於 200 日均的比例（逐日）
+_EXITX = []                # 外掛出場規則：dict(kind=..., M=矩陣, param=值)
+                           # kind: ma_break / donchian / take_profit / time_exit
+                           # 由 exit_compare.py 塞入；空的話行為與原本完全一致
 
 # --atr-stop / --vol-size：實測全部比固定 -12% 差，預設關閉，保留供複驗。
 # --regime：上限 = base × 母體在 200 日均之上的比例（連續映射，不是門檻）。
@@ -283,6 +286,26 @@ def simulate(C, O, L, B, RAW, capital, pos_pct, max_pos, stop_pct, seed,
                   and c[t, j] < p["entry_px"]):
                 px = c[t, j]
                 why = "死錢"
+            if px is None and _EXITX:
+                ex = _EXITX[0]
+                k, prm = ex["kind"], ex.get("param")
+                held = t - p["entry_i"]
+                cl = c[t, j]
+                hit = False
+                if held >= 1 and np.isfinite(cl):
+                    if k == "ma_break":
+                        m = ex["M"][t, j]
+                        hit = np.isfinite(m) and cl < m
+                    elif k == "donchian":
+                        m = ex["M"][t, j]
+                        hit = np.isfinite(m) and cl <= m
+                    elif k == "take_profit":
+                        hit = cl >= p["entry_px"] * (1 + prm)
+                    elif k == "time_exit":
+                        hit = held >= prm
+                if hit:
+                    px = cl
+                    why = k
             if px is not None:
                 gross = px * p["shares"]
                 pending += gross * (1 - COST / 2)
