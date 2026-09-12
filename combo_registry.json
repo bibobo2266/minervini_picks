@@ -1,0 +1,1352 @@
+{
+  "version": "oldhand-2026-09-10",
+  "note": "所有門檻集中在此。程式不內建魔術數字。改這裡等於改研究協定，改完請記錄日期。",
+  "defs": {
+    "breakout_lookback": 250,
+    "breakout_excludes_T": true,
+    "box_window": 60,
+    "touch_band_pct": 2.0,
+    "peak_dedup_gap": 5,
+    "breakout_dedup_gap": 10,
+    "swing_window": 5,
+    "tight_window": 15,
+    "base_depth_window": 120,
+    "vol_ma_window": 20,
+    "vol_contract_window": 5,
+    "er_window": 20,
+    "shakeout_window": 20,
+    "shakeout_recover_days": 3,
+    "recover_scan_window": 60,
+    "atr_window": 14,
+    "normal_range_atr": 1.0,
+    "gap_invalidate_atr": 1.5,
+    "tolerance_pct": 0.3,
+    "c05_high_zone_turnover": "DISABLED — 日 OHLCV 無法得知每筆量成交在哪一價位。手冊第4頁已載明。任何用到 high_zone_turnover 的 combo 一律降級為 PARTIAL。",
+    "c07_formula": "標準 Kaufman ER = |close_t - close_{t-N}| / sum(|每日變動|)。不使用手冊那個真實區間分母版本（口徑有疑義）。"
+  },
+  "thresholds": {
+    "tight_compress": 7.0,
+    "tight_wide": 23.0,
+    "base_deep": 30.0,
+    "base_shallow": 22.0,
+    "cq_high": 0.85,
+    "cq_low": 0.4,
+    "cq_mid_hi": 0.7,
+    "vol_ratio_up": 1.5,
+    "vol_ratio_flat": 1.2,
+    "vol_ratio_blow": 3.0,
+    "vol_contract": 0.6,
+    "rs_lead": 2.0,
+    "er_high": 0.4,
+    "er_low": 0.15,
+    "tests_mid_lo": 3,
+    "tests_mid_hi": 5,
+    "tests_many": 6,
+    "bo_count_early": 1,
+    "bo_count_mature_hi": 3,
+    "bo_count_aged": 4,
+    "days_from_low_lo": 20,
+    "days_from_low_hi": 80,
+    "gain_from_low_early": 50.0,
+    "gain_from_low_aged": 100.0,
+    "shake_shallow_lo": 1.0,
+    "shake_shallow_hi": 5.0,
+    "shake_deep": 8.0,
+    "recover_fast": 5,
+    "recover_slow": 20,
+    "mae3_ref": 4.0,
+    "newhigh_gap_fast": 15,
+    "newhigh_gap_mid": 30,
+    "index_down": -1.0,
+    "tolerance_pct": 0.3,
+    "freeze_days": 250,
+    "tight_p25": 10.2,
+    "tight_p75": 23.1,
+    "cq_weak": 0.25,
+    "gain_parabolic": 150.0,
+    "newhigh_recent": 10
+  },
+  "combos": [
+    {
+      "id": "01",
+      "cls": "A",
+      "name": "高位壓縮、相對領先",
+      "gate": "partial_c05",
+      "when": [
+        "c01_tight<=T.tight_compress",
+        "c06_rs>0",
+        "not above_B",
+        "c05_high_zone>=45"
+      ],
+      "bias": "觀察偏多",
+      "next": "等收盤站上 B，再看 C03 與量比",
+      "fail": "跌離上緣且 RS 轉負，或收盤跌破 L",
+      "dir": "多"
+    },
+    {
+      "id": "02",
+      "cls": "A",
+      "name": "壓縮但相對落後",
+      "when": [
+        "c01_tight<=T.tight_compress",
+        "c05_contract<=T.vol_contract",
+        "c06_rs<0",
+        "not above_B",
+        "not below_L"
+      ],
+      "bias": "橫盤待定",
+      "next": "能否回到箱體上半部且 RS 由負轉正",
+      "fail": "破 L 改看走弱；有效突破則本情境結束",
+      "dir": "中性"
+    },
+    {
+      "id": "03",
+      "cls": "A",
+      "name": "測頂且回檔逐次變淺",
+      "when": [
+        "c02_tests>=T.tests_mid_lo",
+        "c02_tests<=T.tests_mid_hi",
+        "higher_lows",
+        "c01_tight<=T.tight_compress"
+      ],
+      "bias": "觀察偏多",
+      "next": "下一次測頂能否收盤突破，而非只有盤中越線",
+      "fail": "回檔低點不再墊高，並跌破最近一次完成的回檔低點",
+      "dir": "多"
+    },
+    {
+      "id": "04",
+      "cls": "A",
+      "name": "測頂愈多、回檔愈深",
+      "when": [
+        "c02_tests>=T.tests_many",
+        "lower_lows",
+        "c06_rs<0"
+      ],
+      "bias": "偏空結構",
+      "next": "箱底是否守住，反彈能否收復最近失守位置",
+      "fail": "重新形成較高低點且收盤突破上緣",
+      "dir": "空"
+    },
+    {
+      "id": "05",
+      "cls": "A",
+      "name": "底部初測、壓縮未完成",
+      "when": [
+        "c02_tests<=1",
+        "c01_tight>T.tight_compress",
+        "c05_contract>T.vol_contract",
+        "not above_B"
+      ],
+      "bias": "方向待定",
+      "next": "等新的整理資料形成，看低點與振幅是否改善",
+      "fail": "直接收盤突破且量價配合，轉入突破當日評估",
+      "dir": "中性"
+    },
+    {
+      "id": "06",
+      "cls": "A",
+      "name": "深整理後的局部變緊",
+      "when": [
+        "c01_tight<=T.tight_compress",
+        "c01_base_depth>T.base_deep",
+        "c08_gain_from_low<=T.gain_from_low_early"
+      ],
+      "bias": "修復待定",
+      "next": "能否收復大箱體內既定壓力並形成較高低點",
+      "fail": "局部小箱底失守，修復進度倒退",
+      "dir": "中性"
+    },
+    {
+      "id": "07",
+      "cls": "B",
+      "name": "壓縮後帶量收高",
+      "gate": "partial_c05",
+      "when": [
+        "above_B",
+        "c01_tight<=T.tight_compress",
+        "c05_contract<=T.vol_contract",
+        "c05_volratio>=T.vol_ratio_up",
+        "c03_cq>=T.cq_high",
+        "c05_high_zone>=45"
+      ],
+      "bias": "偏多假說",
+      "next": "T+1 後收盤能否維持 B 上方；三日窗完成才看 C10",
+      "fail": "後續收盤跌回箱內，突破延續假說下修",
+      "dir": "多"
+    },
+    {
+      "id": "08",
+      "cls": "B",
+      "name": "收得漂亮、量未放大",
+      "when": [
+        "above_B",
+        "c03_cq>=T.cq_high",
+        "c05_volratio<T.vol_ratio_flat"
+      ],
+      "bias": "確認不足",
+      "next": "看是否在 B 上方形成穩定收盤，而非只等爆量",
+      "fail": "重新收回箱內且 RS 轉弱",
+      "dir": "中性"
+    },
+    {
+      "id": "09",
+      "cls": "B",
+      "name": "大量成交、收在低處",
+      "when": [
+        "high>B",
+        "c03_cq<=T.cq_low",
+        "c05_volratio>=T.vol_ratio_blow"
+      ],
+      "bias": "回落風險",
+      "next": "先辨認收盤是否仍在 B 上；再看能否收復當日高區",
+      "fail": "後續收復當日高區且維持線上",
+      "dir": "空"
+    },
+    {
+      "id": "10",
+      "cls": "B",
+      "name": "帶量但收在中段",
+      "when": [
+        "above_B",
+        "c03_cq>T.cq_low",
+        "c03_cq<T.cq_mid_hi",
+        "c05_volratio>=T.vol_ratio_up"
+      ],
+      "bias": "多空拉鋸",
+      "next": "次日收盤偏向當日高區或低區，以及 B 的得失",
+      "fail": "跌回箱內偏向受挫；收復高區偏向向上確認",
+      "dir": "中性"
+    },
+    {
+      "id": "11",
+      "cls": "B",
+      "name": "寬幅整理後急拉",
+      "when": [
+        "above_B",
+        "c01_tight>=T.tight_wide",
+        "c03_cq>=T.cq_high",
+        "c05_volratio>=T.vol_ratio_up"
+      ],
+      "bias": "偏多但震盪",
+      "next": "後續回檔是否形成較高低點並維持突破區",
+      "fail": "迅速跌回原寬箱體且波幅仍擴大",
+      "dir": "多"
+    },
+    {
+      "id": "12",
+      "cls": "B",
+      "name": "日內收高但未越前高",
+      "when": [
+        "not above_B",
+        "c03_cq>=T.cq_high",
+        "c05_volratio>=T.vol_ratio_up"
+      ],
+      "bias": "尚未突破",
+      "next": "等收盤真正越線，再套用突破日 combo",
+      "fail": "前高附近回落仍屬箱內；跌破 L 則轉弱",
+      "dir": "中性"
+    },
+    {
+      "id": "13",
+      "cls": "C",
+      "name": "較早階段、訊號一致",
+      "when": [
+        "above_B",
+        "c08_bo_count<=T.bo_count_early",
+        "c08_days_from_low>=T.days_from_low_lo",
+        "c08_days_from_low<=T.days_from_low_hi",
+        "c08_gain_from_low<=T.gain_from_low_early",
+        "c01_tight<=T.tight_compress",
+        "c03_cq>=T.cq_high"
+      ],
+      "bias": "偏多假說",
+      "next": "線上接受與新低點是否墊高，勿預設倍數漲幅",
+      "fail": "跌回箱內並失守最近回檔低點",
+      "dir": "多"
+    },
+    {
+      "id": "14",
+      "cls": "C",
+      "name": "成熟趨勢仍順暢",
+      "when": [
+        "above_B",
+        "c08_bo_count>=2",
+        "c08_bo_count<=T.bo_count_mature_hi",
+        "c07_er>=T.er_high",
+        "c07_net>0",
+        "c06_rs>0"
+      ],
+      "bias": "偏多延續",
+      "next": "新的推進是否維持較高低點與相對領先",
+      "fail": "推進轉為原地震盪且跌破最近回檔低點",
+      "dir": "多"
+    },
+    {
+      "id": "15",
+      "cls": "C",
+      "name": "高齡但尚無破壞",
+      "when": [
+        "above_B",
+        "(c08_bo_count>=T.bo_count_aged) or (c08_gain_from_low>T.gain_from_low_aged)",
+        "c03_cq>=T.cq_high",
+        "c06_rs>0"
+      ],
+      "bias": "延續／高位",
+      "next": "加看回檔低點與突破後推進是否衰退，兩情境並列",
+      "fail": "跌破關鍵低點且 RS 轉負",
+      "dir": "多"
+    },
+    {
+      "id": "16",
+      "cls": "C",
+      "name": "高齡加上推進受阻",
+      "when": [
+        "(c08_bo_count>=T.bo_count_aged) or (c08_gain_from_low>T.gain_from_low_aged)",
+        "c07_er<=T.er_low",
+        "c06_rs<0"
+      ],
+      "bias": "轉弱疑慮",
+      "next": "最近支撐是否失守，反彈能否重新領先大盤",
+      "fail": "重新向上推進、效率改善且 RS 回正",
+      "dir": "空"
+    },
+    {
+      "id": "17",
+      "cls": "C",
+      "name": "效率很高但方向向下",
+      "when": [
+        "c07_er>=T.er_high",
+        "c07_net<0",
+        "c06_rs<0"
+      ],
+      "bias": "偏空結構",
+      "next": "下降低點是否停止下移，再看收復前一反彈高點",
+      "fail": "出現較高低點並收復前一反彈高點",
+      "dir": "空"
+    },
+    {
+      "id": "18",
+      "cls": "C",
+      "name": "低效率但箱底穩定",
+      "when": [
+        "c07_er<=T.er_low",
+        "not below_L",
+        "not shake_broken",
+        "abs(c06_rs)<T.rs_lead"
+      ],
+      "bias": "橫盤結構",
+      "next": "哪一側先以收盤突破，並檢查後續是否維持",
+      "fail": "向上或向下離開箱體並獲後續確認",
+      "dir": "中性"
+    },
+    {
+      "id": "19",
+      "cls": "D",
+      "name": "大盤逆風、個股收高",
+      "when": [
+        "above_B",
+        "idx_ret<=T.index_down",
+        "ret>0",
+        "c03_cq>=T.cq_high"
+      ],
+      "bias": "相對偏強",
+      "next": "下一觀察日是否仍守突破區，避免一日例外",
+      "fail": "跌回箱內且後續 RS 轉負",
+      "dir": "多"
+    },
+    {
+      "id": "20",
+      "cls": "D",
+      "name": "隨大盤上漲但落後",
+      "when": [
+        "idx_ret>0",
+        "ret>0",
+        "c06_rs<0",
+        "c03_cq>=T.cq_high"
+      ],
+      "bias": "上漲／落後",
+      "next": "大盤停漲時個股是否仍能守住突破區",
+      "fail": "個股轉跌並失守支撐，或 RS 持續改善",
+      "dir": "中性"
+    },
+    {
+      "id": "21",
+      "cls": "D",
+      "name": "跌得比較少、仍在跌",
+      "when": [
+        "idx_ret<0",
+        "ret<0",
+        "c06_rs>0",
+        "not above_B"
+      ],
+      "bias": "抗跌待定",
+      "next": "能否止住低點下移並收復既定壓力",
+      "fail": "再破低點延續走弱；收復壓力才更新方向",
+      "dir": "中性"
+    },
+    {
+      "id": "22",
+      "cls": "D",
+      "name": "同時領先大盤與產業",
+      "gate": "needs_industry",
+      "when": [
+        "above_B",
+        "ret>0",
+        "c06_rs>0",
+        "c06_rs_ind>0",
+        "c03_cq>=T.cq_high"
+      ],
+      "bias": "相對偏強",
+      "next": "相同基準與期間的領先能否維持",
+      "fail": "產業內落後且 B 失守",
+      "dir": "多"
+    },
+    {
+      "id": "23",
+      "cls": "D",
+      "name": "贏大盤但輸給產業",
+      "gate": "needs_industry",
+      "when": [
+        "c06_rs>0",
+        "c06_rs_ind<0",
+        "c03_cq>=T.cq_high",
+        "ind_ret>0"
+      ],
+      "bias": "產業帶動",
+      "next": "產業震盪時個股是否維持結構，同業差距是否縮小",
+      "fail": "產業轉弱且個股同步失守；或個股轉為同業領先",
+      "dir": "中性"
+    },
+    {
+      "id": "24",
+      "cls": "D",
+      "name": "突破當日領先、近期落後",
+      "when": [
+        "above_B",
+        "c06_rs>=T.rs_lead",
+        "c06_rs20<0",
+        "c03_cq>=T.cq_high"
+      ],
+      "bias": "修復待確認",
+      "next": "未來完成的多日窗是否改善，並守住 B",
+      "fail": "次日回到箱內且多日落後未改善",
+      "dir": "中性"
+    },
+    {
+      "id": "25",
+      "cls": "E",
+      "name": "淺破後收回、上緣仍在",
+      "when": [
+        "shake_depth>=T.shake_shallow_lo",
+        "shake_depth<=T.shake_shallow_hi",
+        "shake_recovered",
+        "c02_tests>=T.tests_mid_lo",
+        "c02_tests<=T.tests_mid_hi",
+        "higher_lows",
+        "not below_L"
+      ],
+      "bias": "修復偏多",
+      "next": "上緣是否突破，回測低點有無墊高",
+      "fail": "再次收盤跌破 L 且尚未收回",
+      "dir": "多"
+    },
+    {
+      "id": "26",
+      "cls": "E",
+      "name": "已收回但破底幅度大",
+      "when": [
+        "shake_depth>T.shake_deep",
+        "shake_recovered",
+        "c06_rs>0"
+      ],
+      "bias": "修復／高波動",
+      "next": "能否在 L 上方形成新低點，再挑戰上緣",
+      "fail": "再次跌破本次修復低點",
+      "dir": "多"
+    },
+    {
+      "id": "27",
+      "cls": "E",
+      "name": "跌破未收、相對也弱",
+      "when": [
+        "below_L",
+        "c06_rs<0",
+        "c11_bars_recover<0"
+      ],
+      "bias": "偏空結構",
+      "next": "看先收回 L 還是繼續創低；記錄失守幾日",
+      "fail": "收回 L 後維持，且不再形成更低低點",
+      "dir": "空"
+    },
+    {
+      "id": "28",
+      "cls": "E",
+      "name": "快速修復但尚未突破",
+      "when": [
+        "c11_bars_recover>=0",
+        "c11_bars_recover<=T.recover_fast",
+        "not below_L",
+        "not above_B"
+      ],
+      "bias": "修復完成",
+      "next": "下一關是前高 B，而非反覆把已修復的長黑當利多",
+      "fail": "跌回壓力日高點下方並失守最近回檔低點",
+      "dir": "多"
+    },
+    {
+      "id": "29",
+      "cls": "E",
+      "name": "修復慢、反彈也落後",
+      "when": [
+        "(c11_bars_recover>T.recover_slow) or (c11_bars_recover<0 and c11_days_elapsed>T.recover_slow)",
+        "c07_er<=T.er_low",
+        "c06_rs<0"
+      ],
+      "bias": "修復偏弱",
+      "next": "能否完成收復並開始形成向上淨位移",
+      "fail": "收復關鍵高點且相對轉正、低點墊高",
+      "dir": "空"
+    },
+    {
+      "id": "30",
+      "cls": "E",
+      "name": "收回箱底但反彈未過關",
+      "when": [
+        "shake_recovered",
+        "not below_L",
+        "c11_bars_recover<0",
+        "c06_rs<0"
+      ],
+      "bias": "局部修復",
+      "next": "以壓力日高點作下一確認位置",
+      "fail": "再度跌回 L 下方，第一層修復也失效",
+      "dir": "中性"
+    },
+    {
+      "id": "31",
+      "cls": "F",
+      "gate": "event_neg",
+      "name": "負面事件、絕對也守住",
+      "when": [
+        "ev_neg",
+        "ev_ret>=0",
+        "c09_excess>=0",
+        "not below_L"
+      ],
+      "bias": "抗壓偏強",
+      "next": "後續完整交易日能否繼續守住支撐與事件日高區",
+      "fail": "後續跌破支撐且相對轉負",
+      "dir": "多"
+    },
+    {
+      "id": "32",
+      "cls": "F",
+      "gate": "event_neg",
+      "name": "負面事件、僅相對抗跌",
+      "when": [
+        "ev_neg",
+        "ev_ret<0",
+        "c09_excess>=0"
+      ],
+      "bias": "抗跌／未止跌",
+      "next": "支撐是否守住，能否收復事件前價格",
+      "fail": "收盤失守支撐；收復事件前價格則改善",
+      "dir": "中性"
+    },
+    {
+      "id": "33",
+      "cls": "F",
+      "gate": "event_pos",
+      "name": "正面事件、收高且越線",
+      "when": [
+        "ev_pos",
+        "above_B",
+        "c03_cq>=T.cq_high",
+        "c05_volratio>=T.vol_ratio_up"
+      ],
+      "bias": "偏多反應",
+      "next": "T 後新價格是否被維持；三日反應要三日後才判",
+      "fail": "跌回 B 下方，事件後向上反應未延續",
+      "dir": "多"
+    },
+    {
+      "id": "34",
+      "cls": "F",
+      "gate": "event_pos",
+      "name": "正面事件、大量回吐",
+      "when": [
+        "ev_pos",
+        "c03_cq<=T.cq_low",
+        "c05_volratio>=T.vol_ratio_blow"
+      ],
+      "bias": "回落疑慮",
+      "next": "收盤是否失守 B，後續能否收復事件日高區",
+      "fail": "後續收復事件日高點並維持",
+      "dir": "空"
+    },
+    {
+      "id": "35",
+      "cls": "F",
+      "gate": "event_neg",
+      "name": "負面事件、失守且落後",
+      "when": [
+        "ev_neg",
+        "c09_excess<0",
+        "below_L",
+        "ret<0"
+      ],
+      "bias": "偏空反應",
+      "next": "修復先站回支撐，還是低點繼續下移",
+      "fail": "站回支撐並停止低點下移",
+      "dir": "空"
+    },
+    {
+      "id": "36",
+      "cls": "F",
+      "gate": "event_after_close",
+      "name": "消息落在收盤之後",
+      "when": [
+        "ev_after_close"
+      ],
+      "bias": "事件待評",
+      "next": "下一交易日完成後才描述公告後反應",
+      "fail": "事件時間或版本核對後不同，重新界定反應窗",
+      "dir": "中性"
+    },
+    {
+      "id": "37",
+      "cls": "G",
+      "name": "次日守線、三日回撤有限",
+      "gate": "post_T",
+      "when": [
+        "above_B",
+        "c10_mae3<=T.mae3_ref",
+        "c06_rs>0"
+      ],
+      "bias": "偏多延續",
+      "next": "能否擴張高點並形成較高低點",
+      "fail": "收盤跌回箱內，或逆行擴大且失守結構",
+      "dir": "多"
+    },
+    {
+      "id": "38",
+      "cls": "G",
+      "name": "盤中破線、收盤收回",
+      "when": [
+        "above_B",
+        "low<B",
+        "not lower_lows"
+      ],
+      "bias": "測試／待定",
+      "next": "後續收盤是否持續在線上並離開 B",
+      "fail": "後續收盤跌回箱內且無法收回",
+      "dir": "中性"
+    },
+    {
+      "id": "39",
+      "cls": "G",
+      "name": "跌回箱內、逆行擴大",
+      "gate": "post_T",
+      "when": [
+        "not above_B",
+        "had_breakout_recent",
+        "c10_mae3>T.mae3_ref",
+        "c06_rs<0"
+      ],
+      "bias": "突破受挫",
+      "next": "若修復，先看能否重新收復 B 並維持",
+      "fail": "重新站回線上且形成較高低點",
+      "dir": "空"
+    },
+    {
+      "id": "40",
+      "cls": "G",
+      "name": "線附近來回、未離開",
+      "when": [
+        "had_breakout_recent",
+        "abs(close-B)/B*100<=T.tolerance_pct*3",
+        "not higher_highs"
+      ],
+      "bias": "橫盤待定",
+      "next": "等價格向一側離開，配合後續收盤與低點變化",
+      "fail": "線上推進成延續；箱內下行成受挫",
+      "dir": "中性"
+    },
+    {
+      "id": "41",
+      "cls": "G",
+      "name": "開高後回補缺口但守線",
+      "when": [
+        "above_B",
+        "gap_filled",
+        "not lower_lows"
+      ],
+      "bias": "結構仍在",
+      "next": "回補後是否形成較高低點並重新擴張高點",
+      "fail": "收盤跌破 B 且失守回檔低點",
+      "dir": "多"
+    },
+    {
+      "id": "42",
+      "cls": "G",
+      "name": "第一次受挫後再突破",
+      "when": [
+        "above_B",
+        "had_failed_breakout",
+        "c03_cq>=T.cq_high",
+        "c05_volratio>=T.vol_ratio_up"
+      ],
+      "bias": "再突破待驗",
+      "next": "以新事件時點追蹤接受，保留舊失守紀錄",
+      "fail": "再次跌回箱內",
+      "dir": "多"
+    },
+    {
+      "id": "43",
+      "cls": "H",
+      "name": "創高持續、低點也墊高",
+      "when": [
+        "c12_days_since_high<T.newhigh_gap_fast",
+        "higher_highs",
+        "c06_rs>0",
+        "higher_lows"
+      ],
+      "bias": "偏多延續",
+      "next": "下一輪回檔是否守住較高低點，創高節奏有無改變",
+      "fail": "最近低點失守且相對轉負",
+      "dir": "多"
+    },
+    {
+      "id": "44",
+      "cls": "H",
+      "name": "創高變慢、支撐尚完整",
+      "when": [
+        "c12_days_since_high>=T.newhigh_gap_fast",
+        "c12_days_since_high<=T.newhigh_gap_mid",
+        "not higher_highs",
+        "not below_L",
+        "c06_rs>=0"
+      ],
+      "bias": "整理／鈍化",
+      "next": "重新創高或跌破最近低點，哪個先發生",
+      "fail": "創高並恢復推進則改善；破低則轉弱",
+      "dir": "中性"
+    },
+    {
+      "id": "45",
+      "cls": "H",
+      "name": "久未創高且同步落後",
+      "when": [
+        "c12_days_since_high>T.newhigh_gap_mid",
+        "not higher_highs",
+        "c06_rs<0",
+        "not higher_lows"
+      ],
+      "bias": "轉弱疑慮",
+      "next": "既定支撐是否失守，反彈是否仍無法過前高",
+      "fail": "重新創高且低點墊高、RS 回正",
+      "dir": "空"
+    },
+    {
+      "id": "46",
+      "cls": "H",
+      "name": "效率衰退但價格續創高",
+      "when": [
+        "c12_decay>0",
+        "c12_days_since_high<T.newhigh_gap_fast",
+        "c06_rs>0"
+      ],
+      "bias": "上行／效率降",
+      "next": "觀察高點擴張幅度與回檔低點",
+      "fail": "結構低點失守且 RS 轉負",
+      "dir": "多"
+    },
+    {
+      "id": "47",
+      "cls": "H",
+      "name": "均線失守、低點尚未破",
+      "when": [
+        "close<ma20",
+        "close>recent_swing_low",
+        "c06_rs>0"
+      ],
+      "bias": "局部轉弱",
+      "next": "能否收復 MA20，或進一步跌破最近回檔低點",
+      "fail": "收復且推進則改善；破低且 RS 轉負則轉弱擴大",
+      "dir": "空"
+    },
+    {
+      "id": "48",
+      "cls": "H",
+      "name": "動能、低點、相對同步轉差",
+      "when": [
+        "c12_days_since_high>T.newhigh_gap_mid",
+        "close<recent_swing_low",
+        "c06_rs<0",
+        "c11_bars_recover<0"
+      ],
+      "bias": "偏空結構",
+      "next": "修復是否先收回失守低點，再恢復較高低點",
+      "fail": "完成收復並重新形成向上高低點",
+      "dir": "空"
+    },
+    {
+      "id": "49",
+      "cls": "I",
+      "gate": "event_contract",
+      "name": "合約承諾明確、價格向上",
+      "when": [
+        "ev_contract_binding",
+        "above_B",
+        "c03_cq>=T.cq_high"
+      ],
+      "bias": "反應偏多",
+      "next": "追蹤履約／驗收條件是否達成，以及線上接受",
+      "fail": "價格跌回箱內；條件未達則更新基本面事實",
+      "dir": "多"
+    },
+    {
+      "id": "50",
+      "cls": "I",
+      "gate": "event_mou",
+      "name": "只有 MOU、價格很熱",
+      "when": [
+        "ev_mou",
+        "above_B",
+        "c03_cq>=T.cq_high",
+        "c05_volratio>=T.vol_ratio_blow"
+      ],
+      "bias": "價強／事實有限",
+      "next": "正式訂單或約束條款是否公布；價格另追蹤突破區",
+      "fail": "回到箱內削弱價格假說；正式條款出現則更新事實層",
+      "dir": "中性"
+    },
+    {
+      "id": "51",
+      "cls": "I",
+      "gate": "event_guidance",
+      "name": "有數字指引、價格卻回吐",
+      "when": [
+        "ev_guidance",
+        "c03_cq<=T.cq_low",
+        "c05_volratio>=T.vol_ratio_blow"
+      ],
+      "bias": "價格偏弱",
+      "next": "能否收復事件日高區；實現值公布後再比較",
+      "fail": "收復高區改善；新公告改變指引則更新事實",
+      "dir": "空"
+    },
+    {
+      "id": "52",
+      "cls": "I",
+      "gate": "event_target_met",
+      "name": "目標實現、價格仍落後",
+      "when": [
+        "ev_target_met",
+        "c06_rs<0",
+        "c03_cq<=T.cq_low"
+      ],
+      "bias": "價格反應偏弱",
+      "next": "是否有新指引或其他同步資訊；價格看失守位置修復",
+      "fail": "收復結構與 RS 回正",
+      "dir": "空"
+    },
+    {
+      "id": "53",
+      "cls": "I",
+      "gate": "event_cashflow",
+      "name": "營運事實與現金回收分歧",
+      "when": [
+        "ev_cashflow_flag",
+        "above_B",
+        "c03_cq>=T.cq_high"
+      ],
+      "bias": "價強／待釐清",
+      "next": "查付款條件、回收、季節性及合併範圍",
+      "fail": "補充揭露解釋則解除疑點；失守突破區則下修",
+      "dir": "中性"
+    },
+    {
+      "id": "54",
+      "cls": "I",
+      "gate": "event_governance",
+      "name": "治理事件公開、支撐失守",
+      "when": [
+        "ev_governance",
+        "below_L",
+        "c06_rs<0"
+      ],
+      "bias": "價格偏空",
+      "next": "核對日期、原因與稀釋條件，追蹤能否收復支撐",
+      "fail": "收復支撐更新價格；事實依正式揭露更新",
+      "dir": "空"
+    },
+    {
+      "id": "55",
+      "cls": "J",
+      "name": "當日很強、既有防守仍弱",
+      "when": [
+        "above_B",
+        "c03_cq>=T.cq_high",
+        "c05_volratio>=T.vol_ratio_up",
+        "c11_bars_recover<0",
+        "c06_rs<0"
+      ],
+      "bias": "矛盾待確認",
+      "next": "核對舊壓力是否高於 B；若是，看能否收復該位置",
+      "fail": "跌回箱內偏受挫；收復舊壓力且領先則改善",
+      "dir": "中性"
+    },
+    {
+      "id": "56",
+      "cls": "J",
+      "name": "看似全優、都是同一日",
+      "when": [
+        "c03_cq>=T.cq_high",
+        "c05_volratio>=T.vol_ratio_up",
+        "c06_rs>0",
+        "same_day_evidence_only"
+      ],
+      "bias": "證據勿重算",
+      "next": "補看事前結構或未來完成的接受資料，分別記錄",
+      "fail": "單日推進消失且結構未支持",
+      "dir": "驗證"
+    },
+    {
+      "id": "57",
+      "cls": "J",
+      "name": "有價與量、缺了背景",
+      "when": [
+        "has_c03_c05",
+        "lacks_background"
+      ],
+      "bias": "PARTIAL",
+      "next": "補足引擎欄位與歷史長度，再比對需要它們的 combo",
+      "fail": "補齊後不符則取消配對；缺值不算不符",
+      "dir": "驗證"
+    },
+    {
+      "id": "58",
+      "cls": "J",
+      "name": "數字齊全但公式對不上",
+      "when": [
+        "definition_dispute"
+      ],
+      "bias": "定義待核",
+      "next": "先取得 registry 版本、單位與窗口；不自行改公式",
+      "fail": "定義確認後重新匹配",
+      "dir": "驗證"
+    },
+    {
+      "id": "59",
+      "cls": "J",
+      "name": "表面跳空、資料口徑待查",
+      "when": [
+        "big_gap",
+        "corporate_action_nearby"
+      ],
+      "bias": "口徑待核",
+      "next": "核對價量還原規則，再由引擎重新產生欄位",
+      "fail": "口徑核實後若仍失守才看走弱",
+      "dir": "驗證"
+    },
+    {
+      "id": "60",
+      "cls": "J",
+      "name": "進場時混入未來成績",
+      "when": [
+        "future_data_present"
+      ],
+      "bias": "時序不合法",
+      "next": "標 FORBIDDEN_AT_ENTRY_TIME，只保留 T 當時已完成的資料",
+      "fail": "移除未來資料後重新描述",
+      "dir": "驗證"
+    },
+    {
+      "id": "61",
+      "cls": "K",
+      "dir": "中性",
+      "name": "長期冷凍",
+      "when": [
+        "c12_days_since_high>T.freeze_days",
+        "c01_tight<=T.tight_p25",
+        "abs(c06_rs)<T.rs_lead"
+      ],
+      "bias": "無事發生",
+      "next": "等振幅或量先變化，再談方向",
+      "fail": "開始創高或跌破箱底，離開冷凍狀態"
+    },
+    {
+      "id": "62",
+      "cls": "K",
+      "dir": "空",
+      "name": "陰跌未破底",
+      "when": [
+        "c03_cq<T.cq_weak",
+        "c06_rs<0",
+        "c11_bars_recover<0",
+        "not below_L"
+      ],
+      "bias": "偏空但結構未破",
+      "next": "箱底守不守得住；收盤品質能否回到中段以上",
+      "fail": "收盤品質回升且 RS 轉正"
+    },
+    {
+      "id": "63",
+      "cls": "K",
+      "dir": "中性",
+      "name": "飆股高檔回落",
+      "when": [
+        "c08_gain_from_low>T.gain_parabolic",
+        "c01_tight>=T.tight_p75",
+        "c12_days_since_high<T.newhigh_recent",
+        "c03_cq<T.cq_low"
+      ],
+      "bias": "高位高波動",
+      "next": "回檔低點是否墊高；波動是否收斂",
+      "fail": "重新創高且收盤品質回到高區，或跌破最近回檔低點"
+    },
+    {
+      "id": "64",
+      "cls": "K",
+      "dir": "中性",
+      "name": "擴張喇叭口",
+      "when": [
+        "lower_lows",
+        "higher_highs"
+      ],
+      "bias": "波動擴張",
+      "next": "哪一側先以收盤確立，並看波幅是否開始收斂",
+      "fail": "重新形成同向的高低點序列"
+    },
+    {
+      "id": "65",
+      "cls": "K",
+      "dir": "中性",
+      "name": "無名突破",
+      "when": [
+        "above_B",
+        "c05_volratio<T.vol_ratio_up",
+        "c03_cq<T.cq_high"
+      ],
+      "bias": "突破但量價平淡",
+      "next": "看收盤能否維持在 B 上方",
+      "fail": "跌回箱內"
+    }
+  ],
+  "priority": [
+    "J",
+    "E",
+    "G",
+    "B",
+    "A",
+    "C",
+    "D",
+    "H",
+    "F",
+    "I",
+    "K"
+  ],
+  "priority_note": "手冊第26頁五層排序：可用性(J) → 結構位置(E/G) → 當日與背景(B/A/C) → 相對與防守(D/H) → 事後更新與基本面(F/I)。不投票、不平均、不計分。 K 類（61–65）是殘差分群長出來的，不在手冊裡，優先序排最後，不搶手冊 60 組的主狀態。",
+  "actions": {
+    "空手": [
+      "不動觀察",
+      "掛突破買 @",
+      "掛回檔買 @",
+      "移出名單"
+    ],
+    "持有_獲利": [
+      "續抱",
+      "停損上移至 @",
+      "減碼",
+      "出場"
+    ],
+    "持有_虧損": [
+      "續抱",
+      "減碼",
+      "出場"
+    ],
+    "持有_近停損": [
+      "依原計畫執行 @",
+      "出場"
+    ],
+    "rule": "每個動作必須帶價位（@）。寫不出價位代表該 combo 定義尚未凍結，不得輸出。"
+  },
+  "dir_note": "多／空／中性是手冊的傾向欄；驗證＝資料品質檢查器，不參與任何報酬統計。偏空組合不可用「買進後報酬」評分。",
+  "calibration": {
+    "sample_start": "2021-01-01",
+    "min_amt": 50000000.0,
+    "built_at": "2026-09-11",
+    "note": "全市場實際百分位。描述性，不含報酬。半年重跑一次；重跑會讓新舊卡片的分位不可比，請記錄版本。",
+    "fields": {
+      "c01_tight": {
+        "n": 759704,
+        "p5": 5.1948,
+        "p25": 10.2063,
+        "p50": 15.601,
+        "p75": 23.1407,
+        "p95": 38.5945,
+        "thresholds": {
+          "2.5": {
+            "pct": 0.4,
+            "label": "極緊",
+            "verdict": "⚠️ 過嚴，幾乎不成立"
+          },
+          "3.0": {
+            "pct": 0.8,
+            "label": "壓縮線",
+            "verdict": "⚠️ 過嚴，幾乎不成立"
+          },
+          "3.5": {
+            "pct": 1.4,
+            "label": "中緊",
+            "verdict": "⚠️ 過嚴，幾乎不成立"
+          },
+          "5.0": {
+            "pct": 4.5,
+            "label": "寬幅線",
+            "verdict": "⚠️ 過嚴，幾乎不成立"
+          }
+        }
+      },
+      "c01_base_depth": {
+        "n": 759704,
+        "p5": 15.3266,
+        "p25": 27.0071,
+        "p50": 36.664,
+        "p75": 47.5755,
+        "p95": 66.5198,
+        "thresholds": {
+          "15.0": {
+            "pct": 4.7,
+            "label": "淺 base",
+            "verdict": "⚠️ 過嚴，幾乎不成立"
+          },
+          "30.0": {
+            "pct": 32.5,
+            "label": "深 base",
+            "verdict": "合理"
+          }
+        }
+      },
+      "c02_tests": {
+        "n": 759704,
+        "p5": 0.0,
+        "p25": 0.0,
+        "p50": 1.0,
+        "p75": 5.0,
+        "p95": 9.0,
+        "thresholds": {
+          "3": {
+            "pct": 65.9,
+            "label": "測頂下限",
+            "verdict": "合理"
+          },
+          "5": {
+            "pct": 79.2,
+            "label": "測頂上限",
+            "verdict": "合理"
+          },
+          "6": {
+            "pct": 84.9,
+            "label": "測試過多",
+            "verdict": "合理"
+          }
+        }
+      },
+      "c03_cq": {
+        "n": 758040,
+        "p5": 0.0,
+        "p25": 0.1429,
+        "p50": 0.4,
+        "p75": 0.7297,
+        "p95": 1.0,
+        "thresholds": {
+          "0.4": {
+            "pct": 49.6,
+            "label": "收低區",
+            "verdict": "篩選力弱（近半數）"
+          },
+          "0.7": {
+            "pct": 72.8,
+            "label": "中段上緣",
+            "verdict": "合理"
+          },
+          "0.85": {
+            "pct": 84.0,
+            "label": "收高區",
+            "verdict": "合理"
+          }
+        }
+      },
+      "c05_volratio": {
+        "n": 759704,
+        "p5": 0.3144,
+        "p25": 0.5875,
+        "p50": 0.9208,
+        "p75": 1.5548,
+        "p95": 4.5035,
+        "thresholds": {
+          "1.2": {
+            "pct": 64.1,
+            "label": "未明顯放量",
+            "verdict": "合理"
+          },
+          "1.5": {
+            "pct": 73.7,
+            "label": "突破量比",
+            "verdict": "合理"
+          },
+          "3.0": {
+            "pct": 90.5,
+            "label": "爆量",
+            "verdict": "合理"
+          }
+        }
+      },
+      "c05_contract": {
+        "n": 759704,
+        "p5": 0.4417,
+        "p25": 0.7245,
+        "p50": 0.9889,
+        "p75": 1.3703,
+        "p95": 2.3417,
+        "thresholds": {
+          "0.6": {
+            "pct": 14.4,
+            "label": "量縮比",
+            "verdict": "合理"
+          }
+        }
+      },
+      "c06_rs": {
+        "n": 758634,
+        "p5": -4.4439,
+        "p25": -1.5407,
+        "p50": -0.0841,
+        "p75": 1.5459,
+        "p95": 6.5388,
+        "thresholds": {
+          "0.0": {
+            "pct": 51.6,
+            "label": "領先/落後分界",
+            "verdict": "篩選力弱（近半數）"
+          },
+          "2.0": {
+            "pct": 79.3,
+            "label": "領先參考",
+            "verdict": "合理"
+          }
+        }
+      },
+      "c07_er": {
+        "n": 759704,
+        "p5": 0.02,
+        "p25": 0.1015,
+        "p50": 0.2137,
+        "p75": 0.3563,
+        "p95": 0.5865,
+        "thresholds": {
+          "0.15": {
+            "pct": 36.2,
+            "label": "低效率",
+            "verdict": "合理"
+          },
+          "0.4": {
+            "pct": 80.6,
+            "label": "高效率",
+            "verdict": "合理"
+          }
+        }
+      },
+      "c08_bo_count": {
+        "n": 759704,
+        "p5": 0.0,
+        "p25": 1.0,
+        "p50": 3.0,
+        "p75": 5.0,
+        "p95": 9.0,
+        "thresholds": {
+          "1": {
+            "pct": 31.6,
+            "label": "初期",
+            "verdict": "合理"
+          },
+          "3": {
+            "pct": 55.0,
+            "label": "成熟上限",
+            "verdict": "篩選力弱（近半數）"
+          },
+          "4": {
+            "pct": 66.1,
+            "label": "高齡",
+            "verdict": "合理"
+          }
+        }
+      },
+      "c08_gain_from_low": {
+        "n": 759704,
+        "p5": 6.7276,
+        "p25": 25.4939,
+        "p50": 52.8455,
+        "p75": 104.4319,
+        "p95": 274.2657,
+        "thresholds": {
+          "50.0": {
+            "pct": 47.9,
+            "label": "初期漲幅上限",
+            "verdict": "篩選力弱（近半數）"
+          },
+          "100.0": {
+            "pct": 73.6,
+            "label": "高齡漲幅",
+            "verdict": "合理"
+          }
+        }
+      },
+      "c12_days_since_high": {
+        "n": 758882,
+        "p5": 0.0,
+        "p25": 12.0,
+        "p50": 61.0,
+        "p75": 197.0,
+        "p95": 471.0,
+        "thresholds": {
+          "15": {
+            "pct": 28.4,
+            "label": "創高快",
+            "verdict": "合理"
+          },
+          "30": {
+            "pct": 37.9,
+            "label": "創高慢",
+            "verdict": "合理"
+          }
+        }
+      }
+    }
+  },
+  "changelog": [
+    {
+      "date": "2026-09-11",
+      "field": "C01 壓縮與 base 深度",
+      "from": {
+        "tight_compress": 3.0,
+        "tight_wide": 5.0,
+        "base_shallow": 15.0
+      },
+      "to": {
+        "tight_compress": 7.0,
+        "tight_wide": 23.0,
+        "base_shallow": 22.0
+      },
+      "reason": "手冊原線是美股振幅尺度。全市場校準：3.0 落在 P0.8、5.0 落在 P4.5、base 15% 落在 P4.7，等於篩空氣（combo 07/13 十年 0 次命中即由此而來）。改為台股同義分位：7.0=P11（壓縮）、23.0=P75（寬幅）、22.0=P15（淺 base）。此變更後的卡片與變更前不可比。"
+    },
+    {
+      "date": "2026-09-11",
+      "field": "新增 K 類 61–65",
+      "reason": "2021 年起 26.5 萬筆殘差做 KMeans(k=8)。k1 長期冷凍 22.3%、k0 陰跌未破底 21.8%、k3 飆股高檔回落 10.4%、k7 擴張喇叭口 6.9%、k6 無名突破 1.4%，合計約 62%。這五格手冊都沒有，共同特徵是它們都不是『突破』問題 —— 手冊的座標原點是突破。新組優先序排在最後，不影響既有 60 組的主狀態指派。"
+    }
+  ]
+}
