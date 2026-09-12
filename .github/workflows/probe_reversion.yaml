@@ -1,0 +1,49 @@
+name: probe_reversion
+
+# 均值回歸引擎（條件式動態出場）。手動觸發，不排程。
+# 用途：測試「跌深反彈」類假說 —— 停損 / 收盤站回 MA20 隔日平倉 / 時間停損，
+# 三種出場先到先算。跟 probe_vcp 的固定持有期不同。
+#
+# 目前已知結論：傳產 Bias20 < -10% 全參數為負（超額 -0.21），假說不成立。
+# 引擎保留是為了之後其他均值回歸類的題目，不用重寫。
+
+on:
+  workflow_dispatch:
+    inputs:
+      stop:
+        description: "固定停損（0.05 / 0.08 / 0.10 / 0.12）"
+        type: string
+        required: false
+        default: "0.08"
+      maxhold:
+        description: "時間停損，交易日（10 / 20 / 40 / 60）"
+        type: string
+        required: false
+        default: "20"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install "pandas<3" "numpy<3" pyarrow
+
+      - name: Run reversion probe
+        run: |
+          python -u scripts/probe_reversion.py \
+            --stop "${{ inputs.stop }}" \
+            --maxhold "${{ inputs.maxhold }}" \
+            | tee probe_reversion.log
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: probe-reversion-stop${{ inputs.stop }}-hold${{ inputs.maxhold }}
+          path: probe_reversion.log
+          if-no-files-found: warn

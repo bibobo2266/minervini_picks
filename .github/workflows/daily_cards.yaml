@@ -43,9 +43,14 @@ jobs:
           echo "date=$(date +%Y-%m-%d)" >> $GITHUB_OUTPUT
           FILES=$(ls out/daily_*.csv out/daily_cards_*.md 2>/dev/null | paste -sd, -)
           echo "files=$FILES" >> $GITHUB_OUTPUT
-          echo "body<<EOF" >> $GITHUB_OUTPUT
-          cat out/summary.txt >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          # heredoc 的結束符必須自成一行。summary.txt 結尾沒有換行符，
+          # 直接 cat 會讓結束符黏在最後一行上，GitHub 就找不到它。
+          {
+            echo "body<<__MAIL_BODY__"
+            cat out/summary.txt
+            echo ""
+            echo "__MAIL_BODY__"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Send mail
         uses: dawidd6/action-send-mail@v3
