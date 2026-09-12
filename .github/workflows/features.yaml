@@ -1,0 +1,97 @@
+name: features
+
+# 老手狀態資料庫。只有兩個按鈕：
+#
+#   daily    每天跑。重算今年的 panel 與狀態表。約 3 分鐘。
+#   rebuild  改過 combo_registry.json 之後跑。整套從頭建，順序自動。約 25 分鐘。
+#
+# 為什麼 rebuild 要一次做完：舊年份的 panel 被 .gitignore 擋著不進 commit
+# （544MB 太大），所以它只存在於這一次執行的 runner 上。
+# 如果分兩次跑，第二次的 runner 是全新的，歷史狀態就建不出來。
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '平常選 daily；改過 registry 才選 rebuild'
+        type: choice
+        options: [daily, rebuild]
+        default: daily
+
+permissions:
+  contents: write
+
+concurrency:
+  group: features
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with: { lfs: true }
+
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+
+      # pandas 鎖 <3：3.0 的 to_datetime 不再自動推斷混合格式，讀 parquet 的
+      # 字串 date 欄會 ValueError。
+      - run: pip install "pandas<3" pyarrow numpy matplotlib tabulate scikit-learn
+
+      - name: daily
+        if: github.event.inputs.mode != 'rebuild'
+        run: |
+          Y="$(date -u +%Y)"
+          python scripts/build_features.py --years "$Y" --chunk 100 --fresh
+          python scripts/build_states.py  --years "$Y"
+
+      - name: rebuild
+        if: github.event.inputs.mode == 'rebuild'
+        run: |
+          # 1) 全部年份的 panel。迴圈是刻意的：pass1 會跳過已完成的 chunk，
+          #    runner 記憶體中途不夠被砍掉時，下一輪從斷點接上去。
+          for i in 1 2 3 4 5 6; do
+            python scripts/build_features.py --chunk 100 && break
+            echo "第 $i 輪中斷，續跑"
+          done
+          # 2) 把手冊參考線換算成台股實際百分位，寫回 registry
+          python scripts/calibrate_registry.py --start 2021-01-01
+          # 3) 全部年份的狀態表 + 殘差桶 + 報表
+          python scripts/build_states.py --report
+
+      - name: commit
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/features data/states combo_registry.json reports || true
+          git diff --staged --quiet || git commit -m "features ${{ github.event.inputs.mode || 'daily' }} $(date +%F)"
+          git pull --rebase || true
+          git push
+
+      - name: 體檢
+        run: |
+          python - <<'PY'
+          import glob, pandas as pd
+          fs = sorted(glob.glob("data/features/features_*.parquet"))
+          ss = sorted(glob.glob("data/states/states_*.parquet"))
+          if not fs:
+              print("::error::panel 不存在"); raise SystemExit(1)
+          d = pd.read_parquet(fs[-1], columns=["date", "stock_id", "c06_rs"])
+          d["date"] = pd.to_datetime(d["date"])
+          last = d["date"].max(); cur = d[d["date"] == last]
+          print(f"::notice::panel 最新日 {last.date()}　當日 {len(cur)} 檔　"
+                f"panel {len(fs)} 年　states {len(ss)} 年")
+          miss = float(cur["c06_rs"].isna().mean())
+          if miss > 0.5:
+              print(f"::warning::最新日 {miss:.0%} 的 c06_rs 缺值，"
+                    f"通常是 index_taiex 落後，D 類 combo 會整類降級")
+          if ss:
+              s = pd.read_parquet(ss[-1], columns=["primary"])
+              r = float((s["primary"] == "").mean())
+              print(f"::notice::最新年殘差率 {r:.1%}")
+              if r > 0.15:
+                  print(f"::warning::殘差率偏高，65 組覆蓋不足，"
+                        f"看 data/states/residual_*.parquet")
+          PY
