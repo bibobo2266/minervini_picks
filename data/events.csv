@@ -1,8 +1,0 @@
-event_id,stock_id,pub_date,pub_time,category,polarity,source_url,excerpt,verification_state
-S1,2634,2017-04-25,,contract,positive,,NCSIST 與漢翔簽署 T-5 製造合約,verified
-S2,2208,2016-12-21,,contract,positive,,台船與海軍簽署 IDS 設計合約,verified
-S5,2645,2025-05-09,,contract,positive,,與 Airbus 簽署直接合作合約並取得 Tier-1,verified
-S7,8033,2025-06-26,,contract,positive,,Overkill 攻擊無人機完成實彈測試與認證,verified
-S8,5222,2025-11-05,,contract,positive,,重訊揭露兩筆國防標案約 9.07 億元,verified
-S9,5009,2019-03-29,,contract,positive,,Safran Landing Systems 與 Bohler 300M 材料認證,verified
-S11,5371,2024-05-20,,contract,positive,,取得國防部兩類無人機資格,verified
