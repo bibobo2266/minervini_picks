@@ -11,9 +11,16 @@
 
 name: 每日動能訊號
 
+# 觸發改成串在 daily_adj 之後（跟 watchlist / daily_cards 一致）。
+# 原本用 GitHub 內建 cron，但內建 cron 是 best-effort，實測會延遲數小時，
+# 有機會在資料還沒更新完就跑，訊號就是舊的。串 workflow_run 才對得準。
+# 內建 cron 保留當備援：萬一 daily_adj 沒跑，這條還是會出訊號。
 on:
+  workflow_run:
+    workflows: ["Daily update (adjusted)"]
+    types: [completed]
   schedule:
-    - cron: '0 8 * * 1-5'      # 週一到週五 08:00 UTC = 16:00 台北
+    - cron: '0 8 * * 1-5'      # 備援。週一到週五 08:00 UTC = 16:00 台北
   workflow_dispatch:
     inputs:
       max_new:
@@ -36,6 +43,9 @@ concurrency:                   # 排程與手動同時觸發時，不要兩個 j
 
 jobs:
   signals:
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -54,8 +64,9 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install pandas numpy pyarrow requests
 
+      # 走 workflow_run 進來時，daily_adj 剛更新完，不用再更新一次。
       - name: 更新價格資料
-        if: ${{ github.event_name == 'schedule' || inputs.update_data == 'true' }}
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.update_data == 'true') }}
         env:
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
         run: |
@@ -90,13 +101,39 @@ jobs:
       - name: 產生訊號
         run: |
           python scripts/simple_momentum.py \
-            --max-new ${{ github.event_name == 'schedule' && '2' || inputs.max_new }}
+            --max-new ${{ github.event_name == 'workflow_dispatch' && inputs.max_new || '2' }}
 
       - name: 存檔備份
         run: |
           # 每天留一份當日快照。狀態檔一旦寫壞，可以從這裡救回來。
           mkdir -p out/signals
           cp SIGNALS.md "out/signals/$(date -u +%Y-%m-%d).md"
+
+      - name: 準備信件內容
+        id: mail
+        run: |
+          # heredoc 的結束符必須自成一行，檔案結尾沒換行會讓它黏在最後一行上。
+          {
+            echo "body<<__MAIL_BODY__"
+            cat SIGNALS.md
+            echo ""
+            echo "__MAIL_BODY__"
+          } >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: 寄出訊號
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.GMAIL_USER }}
+          password: ${{ secrets.GMAIL_APP_PASSWORD }}
+          from: Simple Momentum <${{ secrets.GMAIL_USER }}>
+          to: ${{ secrets.MAIL_TO }}
+          subject: "每日動能訊號 ${{ steps.mail.outputs.date }}"
+          body: ${{ steps.mail.outputs.body }}
+          attachments: SIGNALS.md,data/simple_positions.csv
 
       - name: Commit
         run: |

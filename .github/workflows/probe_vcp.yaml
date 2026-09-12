@@ -7,10 +7,10 @@ on:
         description: "驗證模式"
         type: choice
         required: true
-        default: audit
-        options: [audit, triggers, grid, holdout, overlap]
+        default: all
+        options: [all, audit, triggers, grid, holdout, overlap]
       recipe:
-        description: "配方（audit 模式用）"
+        description: "配方（只有 audit 模式會用到；all 模式三張卡都跑）"
         type: choice
         required: true
         default: vcp
@@ -29,7 +29,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
