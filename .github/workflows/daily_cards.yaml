@@ -1,0 +1,74 @@
+name: Daily cards (execution list)
+
+# 串在 daily_adj 之後，不用固定時間。
+# 理由跟 report_daily 一樣：清單必須反映已經更新過的價格，猜時間做不到。
+# daily_adj 本身由 cron-job.org 從外部觸發（GitHub 內建 cron 會延遲）。
+on:
+  workflow_run:
+    workflows: ["Daily update (adjusted)"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: write        # 要把清單存檔回 repo
+
+concurrency:
+  group: daily-cards
+  cancel-in-progress: false
+
+jobs:
+  cards:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # pandas 3.0 的 to_datetime 不再自動推斷混合格式，鎖版本。
+      - run: pip install "pandas<3" "numpy<3" pyarrow
+
+      - name: Build execution list
+        run: python -u scripts/daily_cards.py
+
+      - name: Collect
+        id: c
+        run: |
+          ls -la out/
+          echo "date=$(date +%Y-%m-%d)" >> $GITHUB_OUTPUT
+          FILES=$(ls out/daily_*.csv out/daily_cards_*.md 2>/dev/null | paste -sd, -)
+          echo "files=$FILES" >> $GITHUB_OUTPUT
+          echo "body<<EOF" >> $GITHUB_OUTPUT
+          cat out/summary.txt >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Send mail
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.GMAIL_USER }}
+          password: ${{ secrets.GMAIL_APP_PASSWORD }}
+          from: ELEC Cards <${{ secrets.GMAIL_USER }}>
+          to: ${{ secrets.MAIL_TO }}
+          subject: "每日執行清單 ${{ steps.c.outputs.date }}"
+          body: ${{ steps.c.outputs.body }}
+          attachments: ${{ steps.c.outputs.files }}
+
+      # 存檔回 repo：手機可直接看歷史清單，也讓實盤與清單能事後對帳。
+      # 對帳很重要——實盤成交價與清單的預估價一定有落差，留檔才查得出來。
+      - name: Archive to repo
+        run: |
+          mkdir -p reports/daily_cards
+          cp out/daily_cards_*.md reports/daily_cards/ 2>/dev/null || true
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add reports/daily_cards
+          git diff --staged --quiet || git commit -m "daily cards ${{ steps.c.outputs.date }}"
+          git push

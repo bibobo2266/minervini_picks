@@ -1,0 +1,62 @@
+name: probe_vcp
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "驗證模式"
+        type: choice
+        required: true
+        default: audit
+        options: [audit, triggers, grid, holdout, overlap]
+      recipe:
+        description: "配方（audit 模式用）"
+        type: choice
+        required: true
+        default: vcp
+        options: [vcp, bare250]
+      sector:
+        description: "族群（audit / triggers 模式用）"
+        type: string
+        required: false
+        default: ELEC
+      size:
+        description: "市值層（LARGE / MID / SMALL）"
+        type: string
+        required: false
+        default: LARGE
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安裝套件
+        run: pip install "pandas<3" pyarrow numpy
+
+      - name: 執行驗證
+        env:
+          OUT_DIR: ${{ github.workspace }}
+        run: |
+          python -u scripts/probe_vcp.py \
+            --mode "${{ inputs.mode }}" \
+            --recipe "${{ inputs.recipe }}" \
+            --sector "${{ inputs.sector }}" \
+            --size "${{ inputs.size }}" \
+            | tee probe_vcp_${{ inputs.mode }}.log
+
+      - name: 上傳結果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-vcp-${{ inputs.mode }}
+          path: |
+            probe_vcp_*.log
+            probe_vcp_grid.csv
+          if-no-files-found: warn
