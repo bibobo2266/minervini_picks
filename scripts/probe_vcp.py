@@ -23,7 +23,9 @@
          序列出現空洞，往前走 250「列」就不是 250 個交易日。
 
 模式
-  --mode audit --recipe vcp       卡片一四件套（預設）
+  --mode all       一次跑完下面全部（預設）。順序是快的、資訊量高的先跑，
+                   萬一逾時中斷，前面的結果仍然有用。
+  --mode audit --recipe vcp       卡片一四件套
   --mode audit --recipe bare250   卡片二四件套（裸 250 日新高，無壓縮門檻）
   --mode audit --recipe rev       卡片三四件套（創 60 日新高 ∧ 月營收 YoY>20%）
   --mode triggers  五種觸發 A 的裸基座比較 + 形態分解
@@ -617,16 +619,45 @@ def mode_grid():
               f"{r.exp60:>+8.2f}{r.base60:>+7.2f}{r.exc60:>+8.2f}{thin}")
 
 
+def _banner(t):
+    print("\n" + "=" * 72)
+    print(f"  {t}")
+    print("=" * 72, flush=True)
+
+
+def mode_all(sec='ELEC', size='LARGE'):
+    """一次跑完所有分析。報告裡的每個數字都會出現在這份 log 裡。"""
+    steps = [
+        ("真樣本外驗證（報告第十節）", lambda: mode_holdout(sec, size)),
+        ("三張卡重疊與相關性（第八節）", lambda: mode_overlap(sec, size)),
+        ("卡片二 裸250 四件套（第六節）", lambda: mode_audit(sec, size, 'bare250')),
+        ("卡片一 VCP 四件套（第二節）", lambda: mode_audit(sec, size, 'vcp')),
+        ("卡片三 營收 四件套（第七節）", lambda: mode_audit(sec, size, 'rev')),
+        ("五種觸發裸基座 + 形態分解（第三節）", lambda: mode_triggers(sec, size)),
+        ("22 格跨族群掃描（第四節）", mode_grid),
+    ]
+    for i, (name, fn) in enumerate(steps, 1):
+        _banner(f"[{i}/{len(steps)}] {name}")
+        try:
+            fn()
+        except Exception as e:                      # 一段掛掉不要拖垮其餘
+            print(f"!! 這一段失敗：{type(e).__name__}: {e}", flush=True)
+        gc.collect()
+    _banner("全部完成")
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", default="audit",
-                    choices=["audit", "triggers", "grid",
+    ap.add_argument("--mode", default="all",
+                    choices=["all", "audit", "triggers", "grid",
                              "holdout", "overlap"])
     ap.add_argument("--sector", default="ELEC")
     ap.add_argument("--size", default="LARGE")
     ap.add_argument("--recipe", default="vcp", choices=["vcp", "bare250"])
     args = ap.parse_args()
-    if args.mode == "grid":
+    if args.mode == "all":
+        mode_all(args.sector, args.size)
+    elif args.mode == "grid":
         mode_grid()
     elif args.mode == "overlap":
         mode_overlap(args.sector, args.size)
