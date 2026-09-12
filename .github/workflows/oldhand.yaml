@@ -1,0 +1,77 @@
+name: oldhand-cards
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '執行模式'
+        type: choice
+        options: [cards, frequency, outcomes]
+        default: cards
+      date:
+        description: '指定日期 YYYY-MM-DD（留空=資料最後一天）'
+        default: ''
+      universe:
+        description: 'universe csv（ids 留空時才用）'
+        default: 'universe_defense.csv'
+      ids:
+        description: '直接貼代號，逗號分隔（手機最好用）：2330,2454,3008'
+        default: ''
+      from_signals:
+        description: '改從某檔案抓四碼代號，例如 SIGNALS.md'
+        default: ''
+      freq_start:
+        description: 'frequency 模式的起始日'
+        default: '2015-01-01'
+  schedule:
+    - cron: '30 9 * * 1-5'   # 台北 17:30，台股收盤後
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with: { lfs: true }
+
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+
+      - run: pip install pandas numpy pyarrow matplotlib tabulate
+
+      - name: 中文字型
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fonts-noto-cjk
+
+      - name: 產生看盤卡
+        if: github.event.inputs.mode != 'frequency'
+        run: |
+          ARGS=""
+          [ -n "${{ github.event.inputs.date }}" ] && ARGS="--date ${{ github.event.inputs.date }}"
+          [ -n "${{ github.event.inputs.ids }}" ] && ARGS="$ARGS --ids ${{ github.event.inputs.ids }}"
+          [ -n "${{ github.event.inputs.from_signals }}" ] && ARGS="$ARGS --from-signals ${{ github.event.inputs.from_signals }}"
+          python scripts/oldhand_cards.py \
+            --universe "${{ github.event.inputs.universe || 'universe_defense.csv' }}" $ARGS
+
+      - name: 命中頻率統計
+        if: github.event.inputs.mode == 'frequency'
+        run: |
+          python scripts/combo_frequency.py \
+            --universe "${{ github.event.inputs.universe || 'universe_defense.csv' }}" \
+            --start "${{ github.event.inputs.freq_start || '2015-01-01' }}" \
+            --respect-thesis
+
+      - name: 命中後結果統計
+        if: github.event.inputs.mode == 'outcomes'
+        run: |
+          python scripts/combo_outcomes.py \
+            --universe "${{ github.event.inputs.universe || 'universe_defense.csv' }}" \
+            --start "${{ github.event.inputs.freq_start || '2015-01-01' }}" \
+            --respect-thesis
+
+      - name: Commit
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add cards reports || true
+          git diff --staged --quiet || git commit -m "chore: oldhand $(date +%F)"
+          git push

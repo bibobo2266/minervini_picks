@@ -1,0 +1,101 @@
+name: build features panel
+
+# 特徵 panel。跑完 daily_adj 之後接著跑，或手動全量重建。
+# pass1 逐 chunk 算特徵並按年切檔，pass2 逐年合併加同日橫斷面分位。
+# pass1 有斷點續跑：part 檔已存在的 chunk 會跳過，容器被 OOM 砍掉直接重跑即可。
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '執行模式'
+        type: choice
+        options: [incremental, full, calibrate, states]
+        default: incremental
+      years:
+        description: 'incremental 要重算哪幾年（逗號分隔，空白=今年）'
+        default: ''
+      calib_start:
+        description: 'calibrate 的樣本起始日'
+        default: '2021-01-01'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: features
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with: { lfs: true }
+
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+
+      - run: pip install "pandas<3" pyarrow numpy matplotlib tabulate
+
+      - name: Incremental（只重算指定年份）
+        if: github.event.inputs.mode == 'incremental' || github.event.inputs.mode == ''
+        run: |
+          Y="${{ github.event.inputs.years }}"
+          [ -z "$Y" ] && Y="$(date -u +%Y)"
+          python scripts/build_features.py --years "$Y" --chunk 100 --fresh
+
+      - name: Full rebuild（全量，會跑很久）
+        if: github.event.inputs.mode == 'full'
+        run: |
+          # 迴圈重跑是刻意的：pass1 會跳過已完成的 chunk，
+          # 所以容器中途被記憶體砍掉時，下一輪會從斷點接上去。
+          for i in 1 2 3 4 5 6; do
+            python scripts/build_features.py --chunk 100 && break
+            echo "第 $i 輪中斷，從斷點續跑"
+          done
+
+      - name: Calibrate（把手冊參考線換算成實際百分位）
+        if: github.event.inputs.mode == 'calibrate'
+        run: |
+          python scripts/calibrate_registry.py \
+            --start "${{ github.event.inputs.calib_start || '2021-01-01' }}"
+
+      - name: States（狀態表 + 殘差桶 + 報表）
+        if: github.event.inputs.mode == 'states'
+        run: |
+          Y="${{ github.event.inputs.years }}"
+          if [ -z "$Y" ]; then
+            python scripts/build_states.py --report
+          else
+            python scripts/build_states.py --years "$Y"
+          fi
+
+      - name: Commit
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/features data/states combo_registry.json reports || true
+          git diff --staged --quiet || git commit -m "features $(date +%F) [${{ github.event.inputs.mode }}]"
+          git pull --rebase || true
+          git push
+
+      - name: Panel 體檢
+        run: |
+          python - <<'PY'
+          import glob, pandas as pd
+          fs = sorted(glob.glob("data/features/features_*.parquet"))
+          if not fs:
+              print("::error::panel 不存在"); raise SystemExit(1)
+          d = pd.read_parquet(fs[-1], columns=["date", "stock_id", "c06_rs"])
+          d["date"] = pd.to_datetime(d["date"])
+          last = d["date"].max()
+          cur = d[d["date"] == last]
+          miss = float(cur["c06_rs"].isna().mean())
+          print(f"::notice::panel 最新日 {last.date()}　當日 {len(cur)} 檔　"
+                f"年度檔案 {len(fs)} 個")
+          if miss > 0.5:
+              print(f"::warning::最新日有 {miss:.0%} 的 c06_rs 缺值，"
+                    f"通常代表 index_taiex 落後，D 類 combo 會整類降級")
+          PY

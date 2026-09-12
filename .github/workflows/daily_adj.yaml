@@ -10,6 +10,13 @@ name: Daily update (adjusted)
 # 排程由 cron-job.org 從外部觸發（POST 到 Actions dispatch API）。
 # GitHub 內建的 cron 是 best-effort，實測 2026-09-01 延遲超過 5 小時，
 # 而 workflow_dispatch 走不同佇列，幾乎即時。
+#
+# 2026-09-11 新增指數更新（見 Update index 那一步）：
+#   index_taiex.parquet 原本只由 build_datasets.yaml 更新，而那支是純手動觸發、
+#   沒有排程。結果是指數只在手動跑的那天前進，行情天天更新、指數原地不動，
+#   落差逐日擴大（發現當下已差 2 個交易日）。C06 相對強弱以指數為唯一基準，
+#   指數缺當日值時 RS 直接變 NaN，看盤卡的 D 類六組會整類靜默失效。
+
 on:
   workflow_dispatch:
 
@@ -42,6 +49,20 @@ jobs:
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
         run: python scripts/daily_update_adj.py
 
+      - name: Update index (TAIEX 價格指數 + 含息報酬指數)
+        # bulk_year 模式：帶 data_id=TAIEX 一次拉一整年，重跑同一年會整年覆蓋，
+        # 不是 append，所以重複執行安全。只拉今年，免費層一次呼叫就夠。
+        # 指數抓失敗不該讓整條日更掛掉（行情才是主體），所以 continue-on-error；
+        # 但下面的新鮮度檢查會把落後印成 warning，不會被無聲吃掉。
+        continue-on-error: true
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+        run: |
+          python scripts/build_datasets.py \
+            --only index_taiex,index_tri \
+            --start "$(date -u +%Y)-01-01" \
+            --sleep 6
+
       - name: Commit
         run: |
           git config user.name  "github-actions[bot]"
@@ -52,12 +73,49 @@ jobs:
           git push
 
       - name: Report freshness
-        # 把資料最新日印在 log 最後一行，翻執行紀錄時一眼看得到有沒有真的更新
+        # 把資料最新日印在 log 最後一行，翻執行紀錄時一眼看得到有沒有真的更新。
+        # 指數落後行情時出 ::warning::，這是 D 類 combo 靜默失效的唯一前兆。
         run: |
           python - <<'PY'
-          import glob, pandas as pd
+          import glob, os, pandas as pd
+
           fs = sorted(glob.glob("data/adj/prices_adj_*.parquet"))
+          px_last = None
           if fs:
               d = pd.read_parquet(fs[-1], columns=["date", "stock_id"])
-              print(f"::notice::資料最新日 {d['date'].max()}　檔數 {d['stock_id'].nunique()}")
+              px_last = pd.to_datetime(d["date"], format="mixed").max()
+              print(f"::notice::行情最新日 {px_last.date()}　檔數 {d['stock_id'].nunique()}")
+
+          ip = "data/futures/index_taiex.parquet"
+          if os.path.exists(ip):
+              di = pd.read_parquet(ip, columns=["date"])
+              ix_last = pd.to_datetime(di["date"], format="mixed").max()
+              print(f"::notice::指數最新日 {ix_last.date()}")
+              if px_last is not None and ix_last < px_last:
+                  gap = len(pd.bdate_range(ix_last, px_last)) - 1
+                  print(f"::warning::指數落後行情 {gap} 個交易日 "
+                        f"（指數 {ix_last.date()} / 行情 {px_last.date()}）。"
+                        f"這段期間 C06 相對強弱為缺值，看盤卡 D 類會整類降級。")
+          else:
+              print("::warning::找不到 index_taiex.parquet，C06 相對強弱無法計算。")
+
+          # 個股停更檢查：落後超過 7 天的四碼普通股。
+          # 2026-09 的中光電 5371 就是這樣該被發現的 —— 它不是漏抓，是投控
+          # 轉換成 3718，舊代號已停止存在。這類事件必須人工判讀，只提醒不擋。
+          if fs and px_last is not None:
+              d["date"] = pd.to_datetime(d["date"], format="mixed")
+              d["stock_id"] = d["stock_id"].astype(str)
+              d = d[d["stock_id"].str.len() == 4]
+              last = d.groupby("stock_id")["date"].max()
+              stale = last[last < px_last - pd.Timedelta(days=7)]
+              if len(stale):
+                  names = {}
+                  if os.path.exists("data/universe.parquet"):
+                      u = pd.read_parquet("data/universe.parquet")
+                      u["stock_id"] = u["stock_id"].astype(str)
+                      names = dict(zip(u["stock_id"], u["stock_name"]))
+                  items = ", ".join(f"{s}{names.get(s, '')}({last[s].date()})"
+                                    for s in sorted(stale.index)[:20])
+                  print(f"::warning::{len(stale)} 檔四碼普通股停更超過 7 天，"
+                        f"請確認停牌／下市／換代號：{items}")
           PY
