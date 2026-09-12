@@ -212,7 +212,7 @@ def main():
     summary = (f"{today} 執行清單\n買進 {len(buys)} 檔 ｜ 在手 {len(pos)} 檔 ｜ "
                f"到期賣出 {len(due)} 檔 ｜ 今日出場 {len(exits)} 檔\n\n" + md)
     with open(f"{OUT}/summary.txt", "w") as f:
-        f.write(summary)
+        f.write(summary.rstrip() + "\n")
     print(md)
 
 
