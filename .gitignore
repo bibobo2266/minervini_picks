@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+
+cards_test/
+cards_sig/
+
+data/features/part_*.parquet
+
+data/features/features_201*.parquet
+data/features/features_202[0-3].parquet
