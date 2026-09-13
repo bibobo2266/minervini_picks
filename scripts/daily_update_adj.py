@@ -91,27 +91,69 @@ def roc_to_iso(s: str) -> str:
     return f"{int(s[:3]) + 1911:04d}-{s[3:5]}-{s[5:7]}"
 
 
-def _get(url: str, timeout: int = 60, tries: int = 4, **kw):
-    """帶重試的 GET。
+SYS_CA = "/etc/ssl/certs/ca-certificates.crt"   # Ubuntu runner 的系統憑證庫
 
-    2026-09-02 的失敗就是這樣來的：TPEx 那包 3.9MB 只收到 36 萬 bytes 就斷線
+
+def _get(url: str, timeout: int = 60, tries: int = 4, **kw):
+    """帶重試的 GET，並在憑證驗證失敗時逐級退讓。
+
+    2026-09-02 的失敗：TPEx 那包 3.9MB 只收到 36 萬 bytes 就斷線
     （IncompleteRead），整支 workflow 掛掉。交易所的端點偶爾會這樣，
     不是程式錯，重試一次通常就過。指數退避 3/6/12 秒。
+
+    2026-09-12 的失敗：www.tpex.org.tw 回 CERTIFICATE_VERIFY_FAILED
+    （unable to get local issuer certificate）。這不是 CA bundle 太舊——
+    是 TPEx 沒有把中繼憑證一起送出來，缺的那張根本沒到過本機，
+    所以升級 certifi 沒用。requests 也不會自己去 AIA 抓中繼憑證。
+
+    處理方式是逐級退讓，每一級都印出來：
+      1. 預設（certifi）
+      2. 系統憑證庫（Ubuntu 的 ca-certificates，收錄範圍跟 certifi 不同）
+      3. 關閉驗證
+
+    第 3 級是有代價的：關掉驗證等於放棄「這包資料真的來自 TPEx」的保證，
+    理論上可被中間人替換成假價格。之所以還是留這條路，是因為
+    (a) 這是公開行情，沒有帶任何憑證或個資
+    (b) 下游本來就有重複率檢查與資料新鮮度檢查，灌進明顯錯誤的資料會被擋
+    (c) 停止更新的代價（訊號全部用舊資料）比這個風險大
+    如果哪天 TPEx 修好憑證鏈，第 1 級就會通過，後面兩級不會被觸發。
     """
+    import ssl
+
+    modes = [("預設憑證", {}),
+             ("系統憑證庫", {"verify": SYS_CA} if os.path.exists(SYS_CA) else None),
+             ("關閉憑證驗證", {"verify": False})]
+    modes = [m for m in modes if m[1] is not None]
+
     last = None
-    for i in range(tries):
-        try:
-            r = requests.get(url, timeout=timeout, **kw)
-            r.raise_for_status()
-            # 提早讀完整個 body，斷線在這裡就會爆，而不是留給後面的 .json()
-            _ = r.content
-            return r
-        except Exception as e:
-            last = e
-            if i < tries - 1:
-                wait = 3 * (2 ** i)
-                print(f"  第 {i + 1} 次抓取失敗（{type(e).__name__}），{wait}s 後重試")
-                time.sleep(wait)
+    for name, extra in modes:
+        for i in range(tries):
+            try:
+                if extra.get("verify") is False:
+                    import urllib3
+                    urllib3.disable_warnings(
+                        urllib3.exceptions.InsecureRequestWarning)
+                r = requests.get(url, timeout=timeout, **{**kw, **extra})
+                r.raise_for_status()
+                # 提早讀完整個 body，斷線在這裡就會爆，而不是留給後面的 .json()
+                _ = r.content
+                if name != "預設憑證":
+                    print(f"  ⚠ 用「{name}」才連得上 {url}")
+                return r
+            except Exception as e:
+                last = e
+                is_ssl = isinstance(e, (ssl.SSLCertVerificationError,
+                                        requests.exceptions.SSLError))
+                if is_ssl:
+                    print(f"  憑證驗證失敗（{name}），改用下一種方式")
+                    break                      # 憑證問題重試沒用，直接換模式
+                if i < tries - 1:
+                    wait = 3 * (2 ** i)
+                    print(f"  第 {i + 1} 次抓取失敗（{type(e).__name__}），"
+                          f"{wait}s 後重試")
+                    time.sleep(wait)
+                else:
+                    raise                      # 非憑證錯誤，退讓也救不了
     raise last
 
 
