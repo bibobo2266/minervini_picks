@@ -52,16 +52,18 @@ jobs:
           [ -n "${{ github.event.inputs.date }}" ] && ARGS="--date ${{ github.event.inputs.date }}"
           [ -n "${{ github.event.inputs.ids }}" ] && ARGS="$ARGS --ids ${{ github.event.inputs.ids }}"
           FS="${{ github.event.inputs.from_signals }}"
-          # 三個輸入都留空時，自動接上 simple_momentum 當天的原始訊號
-          # （價格區間、滿倉、隨機取樣之前的完整清單）。
-          if [ -z "${{ github.event.inputs.ids }}" ] && [ -z "$FS" ]; then
+          UNI="${{ github.event.inputs.universe }}"
+          # 優先序：ids > from_signals > universe（有明確填值） > 自動接當天原始訊號。
+          # universe 要排在自動接之前 —— 否則你填了 watchlist_cpo.csv 卻永遠被
+          # raw 檔蓋掉，因為每天跑動能訊號，raw 檔一定存在。
+          if [ -z "${{ github.event.inputs.ids }}" ] && [ -z "$FS" ] && [ -z "$UNI" ]; then
             LATEST=$(ls -1 out/signals/raw_*.txt 2>/dev/null | sort | tail -1)
             [ -n "$LATEST" ] && FS="$LATEST" && echo "自動接上 $LATEST"
           fi
           [ -n "$FS" ] && ARGS="$ARGS --from-signals $FS"
           ARGS="$ARGS --limit ${{ github.event.inputs.limit || 40 }}"
           python scripts/oldhand_cards.py \
-            --universe "${{ github.event.inputs.universe || 'universe_defense.csv' }}" $ARGS
+            --universe "${UNI:-universe_defense.csv}" $ARGS
 
       - name: 命中頻率統計
         if: github.event.inputs.mode == 'frequency'
@@ -84,8 +86,10 @@ jobs:
         run: |
           DAY=$(ls -1d cards/* 2>/dev/null | sort | tail -1 | xargs -n1 basename)
           echo "day=$DAY" >> $GITHUB_OUTPUT
+          SRC=$(cat "cards/$DAY/_source.txt" 2>/dev/null || echo "名單")
+          echo "src=$SRC" >> $GITHUB_OUTPUT
           if [ -n "$DAY" ]; then
-            zip -qr "cards_$DAY.zip" "cards/$DAY"
+            zip -qr "cards_${SRC}_$DAY.zip" "cards/$DAY"
             # 總表轉成純文字放進信件內文，手機上不用開附件就看得到
             sed -n '1,60p' "cards/$DAY/index.md" > mail_body.txt
             echo "" >> mail_body.txt
@@ -104,9 +108,9 @@ jobs:
           password: ${{ secrets.GMAIL_APP_PASSWORD }}
           from: Oldhand Cards
           to: ${{ secrets.MAIL_TO }}
-          subject: "[老手看盤] ${{ steps.pack.outputs.day }} 盤後卡片"
+          subject: "[老手看盤] ${{ steps.pack.outputs.src }}　${{ steps.pack.outputs.day }}"
           body: file://mail_body.txt
-          attachments: cards_${{ steps.pack.outputs.day }}.zip
+          attachments: cards_${{ steps.pack.outputs.src }}_${{ steps.pack.outputs.day }}.zip
 
       - name: Commit
         run: |
