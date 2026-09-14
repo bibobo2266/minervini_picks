@@ -1,0 +1,73 @@
+name: fetch events
+
+# 重大訊息 event log。
+#
+# ⚠️ 為什麼要獨立排程、而且要排在晚上：
+#   證交所 OpenAPI 的 t187ap04_L 是「當日滾動快照」，不是歷史庫。
+#   收盤是 13:30，但重訊可以發到晚上——而「發言時間晚於收盤」的那些公告，
+#   正是 combo 36 存在的理由。如果跟著 daily_adj 在 17:00 跑，
+#   就會固定漏掉 17:00 之後發布的盤後公告，而且隔天補不回來。
+#   所以排在台北 23:30，把一整天收乾淨。
+#
+#   早上 08:30 再補一班：抓昨晚深夜到今天開盤前的公告，兼作前一班漏跑的保險。
+#   程式用 event_id 去重，重複跑不會寫入重複資料。
+#
+# 漏跑一天 = 那天的重訊永久遺失。這是整套系統裡唯一會因為拖延而不可逆損失的資料。
+
+on:
+  schedule:
+    - cron: '37 15 * * 1-5'   # UTC 15:37 = 台北 23:37（主班，收整天）
+    - cron: '37 0 * * 2-6'    # UTC 00:37 = 台北 08:37（補班，開盤前）
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: events
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+
+      - name: 抓重大訊息
+        run: |
+          python scripts/fetch_mops_events.py | tee /tmp/ev.log
+          grep -E '^新增|^分類|^\[OK\]|^\[WARN\]' /tmp/ev.log \
+            | while read -r L; do echo "::notice::$L"; done
+          # 非假日卻抓到 0 筆，多半是端點改版 —— 這是唯一要盯的失敗模式
+          if grep -q '沒有抓到任何重大訊息' /tmp/ev.log; then
+            echo "::warning::今天 0 筆。若非假日，請檢查 openapi.twse.com.tw 端點是否改版"
+          fi
+
+      - name: Commit
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/events || true
+          git diff --staged --quiet || git commit -m "events $(date -u +%F)"
+          git pull --rebase || true
+          git push
+
+      - name: 累計狀態
+        run: |
+          python - <<'PY'
+          import csv, os, collections
+          p = "data/events/events.csv"
+          if not os.path.exists(p):
+              print("::warning::events.csv 還不存在"); raise SystemExit(0)
+          rows = list(csv.DictReader(open(p, encoding="utf-8")))
+          if not rows: raise SystemExit(0)
+          days = sorted({r["pub_date"] for r in rows})
+          cat = collections.Counter(r["category"] for r in rows)
+          after = sum(1 for r in rows if r.get("pub_time", "") >= "13:30")
+          print(f"::notice::event log 累計 {len(rows)} 筆，涵蓋 {len(days)} 個交易日"
+                f"（{days[0]} ~ {days[-1]}），盤後公告 {after} 筆")
+          print("::notice::分類 " + "、".join(f"{k} {v}" for k, v in cat.most_common(6)))
+          PY
