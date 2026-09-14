@@ -18,8 +18,11 @@ on:
         description: '直接貼代號，逗號分隔（手機最好用）：2330,2454,3008'
         default: ''
       from_signals:
-        description: '改從某檔案抓四碼代號，例如 SIGNALS.md'
+        description: '從某檔案抓代號。留空且 ids 也留空時，自動用當天的原始動能訊號'
         default: ''
+      limit:
+        description: '最多產幾張完整卡片（含圖）。超過的只進總表'
+        default: '40'
       freq_start:
         description: 'frequency 模式的起始日'
         default: '2015-01-01'
@@ -48,7 +51,15 @@ jobs:
           ARGS=""
           [ -n "${{ github.event.inputs.date }}" ] && ARGS="--date ${{ github.event.inputs.date }}"
           [ -n "${{ github.event.inputs.ids }}" ] && ARGS="$ARGS --ids ${{ github.event.inputs.ids }}"
-          [ -n "${{ github.event.inputs.from_signals }}" ] && ARGS="$ARGS --from-signals ${{ github.event.inputs.from_signals }}"
+          FS="${{ github.event.inputs.from_signals }}"
+          # 三個輸入都留空時，自動接上 simple_momentum 當天的原始訊號
+          # （價格區間、滿倉、隨機取樣之前的完整清單）。
+          if [ -z "${{ github.event.inputs.ids }}" ] && [ -z "$FS" ]; then
+            LATEST=$(ls -1 out/signals/raw_*.txt 2>/dev/null | sort | tail -1)
+            [ -n "$LATEST" ] && FS="$LATEST" && echo "自動接上 $LATEST"
+          fi
+          [ -n "$FS" ] && ARGS="$ARGS --from-signals $FS"
+          ARGS="$ARGS --limit ${{ github.event.inputs.limit || 40 }}"
           python scripts/oldhand_cards.py \
             --universe "${{ github.event.inputs.universe || 'universe_defense.csv' }}" $ARGS
 
