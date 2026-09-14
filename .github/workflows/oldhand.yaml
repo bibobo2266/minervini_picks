@@ -68,6 +68,35 @@ jobs:
             --start "${{ github.event.inputs.freq_start || '2015-01-01' }}" \
             --respect-thesis
 
+      - name: 打包
+        id: pack
+        run: |
+          DAY=$(ls -1d cards/* 2>/dev/null | sort | tail -1 | xargs -n1 basename)
+          echo "day=$DAY" >> $GITHUB_OUTPUT
+          if [ -n "$DAY" ]; then
+            zip -qr "cards_$DAY.zip" "cards/$DAY"
+            # 總表轉成純文字放進信件內文，手機上不用開附件就看得到
+            sed -n '1,60p' "cards/$DAY/index.md" > mail_body.txt
+            echo "" >> mail_body.txt
+            echo "完整卡片（每檔 .md + 標註圖）在附件 zip，或 repo 的 cards/$DAY/" >> mail_body.txt
+          fi
+
+      - name: 寄出卡片
+        if: steps.pack.outputs.day != ''
+        continue-on-error: true
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.GMAIL_USER }}
+          password: ${{ secrets.GMAIL_APP_PASSWORD }}
+          from: Oldhand Cards
+          to: ${{ secrets.MAIL_TO }}
+          subject: "[老手看盤] ${{ steps.pack.outputs.day }} 盤後卡片"
+          body: file://mail_body.txt
+          attachments: cards_${{ steps.pack.outputs.day }}.zip
+
       - name: Commit
         run: |
           git config user.name  "github-actions[bot]"

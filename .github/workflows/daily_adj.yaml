@@ -63,6 +63,15 @@ jobs:
             --start "$(date -u +%Y)-01-01" \
             --sleep 6
 
+      - name: Fetch 重大訊息（event log）
+        # 證交所 keyless OpenAPI。⚠️ 是當日滾動快照不是歷史庫，
+        # 漏跑一天就補不回來，所以放在日更裡跑，且不讓它失敗擋住主流程。
+        continue-on-error: true
+        run: |
+          python scripts/fetch_mops_events.py | tee /tmp/ev.log
+          # 把當天新增幾筆、分類分佈印成 Actions 的 notice，翻執行紀錄一眼看得到
+          grep -E '^新增|^分類' /tmp/ev.log | while read -r L; do echo "::notice::重訊 $L"; done
+
       - name: Commit
         run: |
           git config user.name  "github-actions[bot]"
