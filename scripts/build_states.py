@@ -224,6 +224,15 @@ def report(args, meta):
         if rows:
             L.append(pd.DataFrame(rows).to_markdown(index=False))
 
+        # 卡片要用：每個狀態之後最常變成什麼 + 依方向彙總
+        m["dir"] = [meta[c]["dir"] for c in m["next"]]
+        m.to_parquet(f"{OUT}/transitions.parquet", index=False)
+        dirsum = (m.groupby(["primary", "dir"])["n"].sum().reset_index())
+        dirsum["占比%"] = (100 * dirsum["n"] /
+                          dirsum.groupby("primary")["n"].transform("sum")).round(1)
+        dirsum.to_parquet(f"{OUT}/transitions_dir.parquet", index=False)
+        print(f"寫入 {OUT}/transitions.parquet（卡片會讀）")
+
     L.append("\n\n---\n_狀態統計，不含報酬、不含勝率。轉移機率是歷史頻率，"
              "不是預測。_\n")
     os.makedirs("reports", exist_ok=True)
