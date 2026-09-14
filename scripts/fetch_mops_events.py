@@ -60,6 +60,26 @@ NEG_KW = ["裁罰", "處分書", "訴訟", "跳票", "違約", "停工", "重大
           "下修", "解任", "辭任", "減資彌補虧損"]
 
 
+def norm_time(s: str) -> str:
+    """發言時間正規化成 HH:MM:SS。
+
+    ⚠️ 證交所回的是無冒號純數字，而且<b>長度不固定</b>：
+       早上 7:00:04 回 "70004"（5 碼）、下午 13:30:00 回 "133000"（6 碼）。
+       直接拿去做字串比較會錯（"70004" > "133000"），combo 36 的盤後判定會全錯。
+       所以一律補零到 6 碼再切。
+    """
+    t = "".join(ch for ch in (s or "") if ch.isdigit())
+    if not t:
+        return ""
+    if len(t) > 6:          # 有些來源帶毫秒
+        t = t[:6]
+    t = t.zfill(6)
+    hh, mm, ss = t[:2], t[2:4], t[4:6]
+    if not (0 <= int(hh) <= 23 and 0 <= int(mm) <= 59 and 0 <= int(ss) <= 59):
+        return ""
+    return f"{hh}:{mm}:{ss}"
+
+
 def roc_to_iso(s: str) -> str:
     """民國日期轉西元。1150521 或 115/05/21 都吃。轉不出來回空字串。"""
     s = (s or "").strip().replace("/", "").replace("-", "")
@@ -117,7 +137,7 @@ def normalize(row: dict, source: str, url: str) -> dict | None:
     pub_date = roc_to_iso(get(row, "發言日期", "DateOfSpeech"))
     if not pub_date:
         return None
-    pub_time = get(row, "發言時間", "TimeOfSpeech")
+    pub_time = norm_time(get(row, "發言時間", "TimeOfSpeech"))
     subject = get(row, "主旨", "Subject", "主旨 ")
     clause = get(row, "符合條款", "Clause")
     desc = get(row, "說明", "Description")
@@ -165,21 +185,45 @@ def main():
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     existing = set()
-    if os.path.exists(args.out):
-        with open(args.out, encoding="utf-8") as f:
+    if os.path.exists(args.out) and os.path.getsize(args.out) > 0:
+        with open(args.out, encoding="utf-8", newline="") as f:
+            rd = csv.reader(f)
+            try:
+                header = next(rd)
+            except StopIteration:
+                header = []
+        # 舊版標頭是 9 欄、新版 13 欄。欄數或順序不符就直接停手，
+        # 不能默默 append —— 那會讓每一欄從第 7 格開始整排錯位。
+        if header != COLS:
+            print("::error::既有 CSV 的標頭跟目前的欄位定義不符，拒絕寫入。")
+            print(f"  檔案：{args.out}")
+            print(f"  既有 {len(header)} 欄：{','.join(header)}")
+            print(f"  目前 {len(COLS)} 欄：{','.join(COLS)}")
+            print("  處理方式：把這個檔案刪掉（或改名備份），下次執行會用新標頭重建。")
+            sys.exit(1)
+        with open(args.out, encoding="utf-8", newline="") as f:
             for r in csv.DictReader(f):
                 existing.add(r.get("event_id", ""))
 
-    new = [r for r in rows if r["event_id"] not in existing]
+    # 去重要做兩層：對既有檔案，也對這一次抓到的批次本身。
+    # 上市與上櫃是兩個端點，理論上不會重疊，但端點若曾短暫混供就會寫入兩筆同 id。
+    new, batch = [], set()
+    for r in rows:
+        if r["event_id"] in existing or r["event_id"] in batch:
+            continue
+        batch.add(r["event_id"])
+        new.append(r)
     dup = len(rows) - len(new)
 
     # 盤後公告：發言時間晚於 13:30，combo 36 靠這個判定
-    after = sum(1 for r in new if r["pub_time"] and r["pub_time"] >= "13:30")
+    after = sum(1 for r in new if r["pub_time"] and r["pub_time"] >= "13:30:00")
+    notime = sum(1 for r in new if not r["pub_time"])
     cats = {}
     for r in new:
         cats[r["category"]] = cats.get(r["category"], 0) + 1
 
-    print(f"\n新增 {len(new)} 筆（重複略過 {dup}）　盤後公告 {after} 筆")
+    print(f"\n新增 {len(new)} 筆（重複略過 {dup}）　盤後公告 {after} 筆"
+          + (f"　⚠️ 無發言時間 {notime} 筆" if notime else ""))
     print("分類：" + "、".join(f"{k} {v}" for k, v in sorted(cats.items(),
                                                           key=lambda x: -x[1])))
     if args.dry_run:
@@ -189,7 +233,7 @@ def main():
         print("(dry-run，沒有寫檔)")
         return
 
-    fresh = not os.path.exists(args.out)
+    fresh = (not os.path.exists(args.out)) or os.path.getsize(args.out) == 0
     with open(args.out, "a", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=COLS)
         if fresh:
