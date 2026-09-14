@@ -212,7 +212,10 @@ def step(pos, m, today, max_new=0):
         added.append(f"{sid} {nm}（{ind}）收 {c.at[today, sid]:.2f}")
     if rows:
         pos = pd.concat([pos, pd.DataFrame(rows)], ignore_index=True)
-    return pos, filled, exited, added, len(sigs), n_band, n_full
+    # raw = 價格區間、滿倉、隨機取樣「之前」的完整訊號清單。
+    # 那三層都是部位限制（這 100 萬能買幾檔），不是訊號本身的性質。
+    # 老手看盤卡只需要訊號，所以另外輸出一份，不影響上面任何決策。
+    return pos, filled, exited, added, len(sigs), n_band, n_full, sorted(sigs)
 
 
 def summary(pos):
@@ -294,7 +297,7 @@ def main():
     today = m["c"].index[-1]
     print(f"資料最新日 {today.date()}　母體 {m['c'].shape[1]} 檔")
 
-    pos, filled, exited, added, n_sig, n_band, n_full = step(
+    pos, filled, exited, added, n_sig, n_band, n_full, raw = step(
         pos, m, today, args.max_new)
 
     os.makedirs("data", exist_ok=True)
@@ -302,6 +305,20 @@ def main():
     with open(REPORT, "w", encoding="utf-8") as f:
         f.write(report(pos, m, today, filled, exited, added, n_sig,
                        args.max_new, n_band, n_full))
+
+    # 原始訊號清單，給老手看盤卡吃。含目前持有中與冷卻期內的標的 ——
+    # 持有中的更該每天看狀態卡（動作表的「持有」三格就是為此存在）。
+    os.makedirs("out/signals", exist_ok=True)
+    raw_path = f"out/signals/raw_{today.date().isoformat()}.txt"
+    uni_r = M.load_universe()
+    with open(raw_path, "w", encoding="utf-8") as f:
+        f.write(f"# 創 {HIGH_WIN} 日新高原始訊號　{today.date()}　共 {len(raw)} 檔\n")
+        f.write("# 未套用價格區間、滿倉與隨機取樣 —— 那三層是部位限制，不是訊號性質\n")
+        for sid in raw:
+            nm = uni_r.loc[sid, "stock_name"] if sid in uni_r.index else ""
+            px = m["c"].at[today, sid] if sid in m["c"].columns else float("nan")
+            f.write(f"{sid} {nm} {px:.2f}\n")
+    print(f"原始訊號 {len(raw)} 檔 → {raw_path}")
 
     print(f"新訊號 {n_sig} 檔，收錄 {len(added)}；成交 {len(filled)}；"
           f"出場 {len(exited)}")
