@@ -301,8 +301,11 @@ def main():
         uni = pd.DataFrame({"stock_id": clean,
                             "name": [names.get(i, "") for i in clean],
                             "state": "空手"})
+        src_label = ("手動指定" if args.ids
+                     else os.path.splitext(os.path.basename(args.from_signals))[0])
         print(f"母體來自 {'--ids' if args.ids else args.from_signals}：{len(clean)} 檔")
     else:
+        src_label = os.path.splitext(os.path.basename(args.universe))[0]
         uni = pd.read_csv(args.universe, dtype=str)
         if "stock_id" not in uni.columns:
             sys.exit("universe 檔需要 stock_id 欄（可另含 name、thesis_date、state）")
@@ -439,13 +442,17 @@ def main():
     if out_root and index_rows:
         t = pd.DataFrame(index_rows)
         with open(os.path.join(out_root, "index.md"), "w", encoding="utf-8") as f:
-            f.write(f"# 盤後看盤卡 {os.path.basename(out_root)}\n\n")
+            f.write(f"# 盤後看盤卡 {os.path.basename(out_root)}"
+                    f"　｜　名單：{src_label}（{len(index_rows)} 檔）\n\n")
             f.write(t.to_markdown(index=False))
             n_stale = int((t["資料"] != "OK").sum())
             if n_stale:
                 f.write(f"\n\n⚠️ {n_stale} 檔資料過期，其分支價位不可用。\n")
             f.write("\n_狀態描述，非買賣指令，無勝率估計。_\n")
-        print(f"\n寫入 {out_root}/index.md")
+        # 把名單來源寫進檔案，workflow 拿它當信件主旨
+        with open(os.path.join(out_root, "_source.txt"), "w", encoding="utf-8") as f:
+            f.write(src_label)
+        print(f"\n寫入 {out_root}/index.md　（名單：{src_label}）")
 
 
 if __name__ == "__main__":
