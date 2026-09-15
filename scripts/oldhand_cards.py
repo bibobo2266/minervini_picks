@@ -441,7 +441,11 @@ def main():
 
     if out_root and index_rows:
         t = pd.DataFrame(index_rows)
-        with open(os.path.join(out_root, "index.md"), "w", encoding="utf-8") as f:
+        # 每份名單各寫一份總表，檔名帶名單來源。
+        # 原本全部寫成 index.md，一天跑四份名單就只剩最後一份的總表 ——
+        # 那會讓「天天跑、事後回頭對照」變成不可能，等於毀掉觀察紀錄本身。
+        idx_name = f"index_{src_label}.md"
+        with open(os.path.join(out_root, idx_name), "w", encoding="utf-8") as f:
             f.write(f"# 盤後看盤卡 {os.path.basename(out_root)}"
                     f"　｜　名單：{src_label}（{len(index_rows)} 檔）\n\n")
             f.write(t.to_markdown(index=False))
@@ -452,7 +456,22 @@ def main():
         # 把名單來源寫進檔案，workflow 拿它當信件主旨
         with open(os.path.join(out_root, "_source.txt"), "w", encoding="utf-8") as f:
             f.write(src_label)
-        print(f"\n寫入 {out_root}/index.md　（名單：{src_label}）")
+
+        # 當日所有名單的目錄，後跑的會把先跑的一起列進來，不互相覆蓋
+        import glob as _glob
+        allidx = sorted(_glob.glob(os.path.join(out_root, "index_*.md")))
+        with open(os.path.join(out_root, "index.md"), "w", encoding="utf-8") as f:
+            f.write(f"# 盤後看盤卡 {os.path.basename(out_root)}\n\n")
+            f.write(f"今天共 {len(allidx)} 份名單：\n\n")
+            for a in allidx:
+                nm = os.path.basename(a)[6:-3]
+                first = ""
+                for line in open(a, encoding="utf-8"):
+                    if line.startswith("# "):
+                        first = line[2:].strip()
+                        break
+                f.write(f"- [{nm}]({os.path.basename(a)})　{first}\n")
+        print(f"\n寫入 {out_root}/{idx_name}　（名單：{src_label}）")
 
 
 if __name__ == "__main__":
