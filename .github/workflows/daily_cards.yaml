@@ -33,10 +33,27 @@ jobs:
       # pandas 3.0 的 to_datetime 不再自動推斷混合格式，鎖版本。
       - run: pip install "pandas<3" "numpy<3" pyarrow
 
+      - name: 今天跑過了沒
+        # daily_adj 一天跑兩班（冪等雙班），下游都掛在 workflow_run 上，
+        # 所以每天被觸發兩次、寄兩封一模一樣的信。這道閘門讓「當天第一次」
+        # 才真的做事。內建 cron 的備援語意也因此才成立：
+        # 只有前面真的沒跑成功時，它才會做事。
+        id: guard
+        run: |
+          MARK="out/cards/$(TZ=Asia/Taipei date +%Y-%m-%d)"
+          if [ -e "$MARK" ]; then
+            echo "already=true" >> $GITHUB_OUTPUT
+            echo "::notice::$MARK 已存在，今天跑過了，跳過（避免重複寄信）"
+          else
+            echo "already=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Build execution list
+        if: steps.guard.outputs.already != 'true'
         run: python -u scripts/daily_cards.py
 
       - name: Collect
+        if: steps.guard.outputs.already != 'true'
         id: c
         run: |
           ls -la out/
@@ -53,6 +70,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Send mail
+        if: steps.guard.outputs.already != 'true'
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
@@ -69,6 +87,7 @@ jobs:
       # 存檔回 repo：手機可直接看歷史清單，也讓實盤與清單能事後對帳。
       # 對帳很重要——實盤成交價與清單的預估價一定有落差，留檔才查得出來。
       - name: Archive to repo
+        if: steps.guard.outputs.already != 'true'
         run: |
           mkdir -p reports/daily_cards
           cp out/daily_cards_*.md reports/daily_cards/ 2>/dev/null || true

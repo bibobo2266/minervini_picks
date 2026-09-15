@@ -59,13 +59,30 @@ jobs:
           cache: 'pip'
 
       - name: 安裝套件
+        if: steps.guard.outputs.already != 'true'
         run: |
           python -m pip install -U pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install pandas numpy pyarrow requests
 
       # 走 workflow_run 進來時，daily_adj 剛更新完，不用再更新一次。
+      - name: 今天跑過了沒
+        # daily_adj 一天跑兩班（冪等雙班），下游都掛在 workflow_run 上，
+        # 所以每天被觸發兩次、寄兩封一模一樣的信。這道閘門讓「當天第一次」
+        # 才真的做事。內建 cron 的備援語意也因此才成立：
+        # 只有前面真的沒跑成功時，它才會做事。
+        id: guard
+        run: |
+          MARK="out/signals/raw_$(TZ=Asia/Taipei date +%Y-%m-%d).txt"
+          if [ -e "$MARK" ]; then
+            echo "already=true" >> $GITHUB_OUTPUT
+            echo "::notice::$MARK 已存在，今天跑過了，跳過（避免重複寄信）"
+          else
+            echo "already=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: 更新價格資料
+        if: steps.guard.outputs.already != 'true'
         if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.update_data == 'true') }}
         env:
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
@@ -78,6 +95,7 @@ jobs:
             echo "::warning::資料更新失敗，改用現有 parquet 繼續"
 
       - name: 檢查資料新鮮度
+        if: steps.guard.outputs.already != 'true'
         run: |
           python - <<'PY'
           import glob, sys, datetime as dt
@@ -99,17 +117,20 @@ jobs:
           PY
 
       - name: 產生訊號
+        if: steps.guard.outputs.already != 'true'
         run: |
           python scripts/simple_momentum.py \
             --max-new ${{ github.event_name == 'workflow_dispatch' && inputs.max_new || '2' }}
 
       - name: 存檔備份
+        if: steps.guard.outputs.already != 'true'
         run: |
           # 每天留一份當日快照。狀態檔一旦寫壞，可以從這裡救回來。
           mkdir -p out/signals
           cp SIGNALS.md "out/signals/$(date -u +%Y-%m-%d).md"
 
       - name: 準備信件內容
+        if: steps.guard.outputs.already != 'true'
         id: mail
         run: |
           # heredoc 的結束符必須自成一行，檔案結尾沒換行會讓它黏在最後一行上。
@@ -122,6 +143,7 @@ jobs:
           echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
 
       - name: 寄出訊號
+        if: steps.guard.outputs.already != 'true'
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
@@ -136,6 +158,7 @@ jobs:
           attachments: SIGNALS.md,data/simple_positions.csv
 
       - name: Commit
+        if: steps.guard.outputs.already != 'true'
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"

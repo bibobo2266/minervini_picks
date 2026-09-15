@@ -23,11 +23,14 @@ on:
       limit:
         description: '最多產幾張完整卡片（含圖）。超過的只進總表'
         default: '40'
+      force:
+        description: '同一天要跑第二份名單就設 true'
+        default: 'false'
       freq_start:
         description: 'frequency 模式的起始日'
         default: '2015-01-01'
-  schedule:
-    - cron: '30 9 * * 1-5'   # 台北 17:30，台股收盤後
+  # 內建 cron 已移除：實測 17:30 排程延遲到 22:50 才跑，
+  # 改由 cron-job.org 從外部觸發 dispatch API（跟 daily_adj 同一套機制）。
 
 jobs:
   run:
@@ -43,9 +46,24 @@ jobs:
       - run: pip install pandas numpy pyarrow matplotlib tabulate
 
       - name: 中文字型
+        if: steps.guard.outputs.already != 'true'
         run: sudo apt-get update -qq && sudo apt-get install -y -qq fonts-noto-cjk
 
+      - name: 今天跑過了沒
+        # 同 daily_momentum：避免同一天被觸發兩次而寄兩封重複的卡片信。
+        # 想在同一天跑第二份名單時，用 force=true 繞過。
+        id: guard
+        run: |
+          MARK="cards/$(TZ=Asia/Taipei date +%Y-%m-%d)/index.md"
+          if [ -e "$MARK" ] && [ "${{ github.event.inputs.force }}" != "true" ]; then
+            echo "already=true" >> $GITHUB_OUTPUT
+            echo "::notice::$MARK 已存在。要在同一天跑第二份名單請把 force 設 true"
+          else
+            echo "already=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: 產生看盤卡
+        if: steps.guard.outputs.already != 'true'
         if: github.event.inputs.mode != 'frequency'
         run: |
           ARGS=""
@@ -66,6 +84,7 @@ jobs:
             --universe "${UNI:-universe_defense.csv}" $ARGS
 
       - name: 命中頻率統計
+        if: steps.guard.outputs.already != 'true'
         if: github.event.inputs.mode == 'frequency'
         run: |
           python scripts/combo_frequency.py \
@@ -74,6 +93,7 @@ jobs:
             --respect-thesis
 
       - name: 命中後結果統計
+        if: steps.guard.outputs.already != 'true'
         if: github.event.inputs.mode == 'outcomes'
         run: |
           python scripts/combo_outcomes.py \
@@ -82,6 +102,7 @@ jobs:
             --respect-thesis
 
       - name: 打包
+        if: steps.guard.outputs.already != 'true'
         id: pack
         run: |
           DAY=$(ls -1d cards/* 2>/dev/null | sort | tail -1 | xargs -n1 basename)
@@ -97,6 +118,7 @@ jobs:
           fi
 
       - name: 寄出卡片
+        if: steps.guard.outputs.already != 'true'
         if: steps.pack.outputs.day != ''
         continue-on-error: true
         uses: dawidd6/action-send-mail@v3
@@ -113,6 +135,7 @@ jobs:
           attachments: cards_${{ steps.pack.outputs.src }}_${{ steps.pack.outputs.day }}.zip
 
       - name: Commit
+        if: steps.guard.outputs.already != 'true'
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
