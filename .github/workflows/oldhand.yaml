@@ -121,7 +121,9 @@ jobs:
         run: |
           DAY=$(ls -1d cards/* 2>/dev/null | sort | tail -1 | xargs -n1 basename)
           echo "day=$DAY" >> $GITHUB_OUTPUT
-          SRC=$(cat "cards/$DAY/_source.txt" 2>/dev/null || echo "名單")
+          # 同樣的坑：GITHUB_OUTPUT 只吃單行，_source.txt 若帶換行就會爆
+          SRC=$(head -1 "cards/$DAY/_source.txt" 2>/dev/null | tr -d '\r\n' || true)
+          SRC=${SRC:-名單}
           echo "src=$SRC" >> $GITHUB_OUTPUT
           if [ -n "$DAY" ]; then
             zip -qr "cards_${SRC}_$DAY.zip" "cards/$DAY"

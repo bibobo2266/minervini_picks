@@ -86,10 +86,19 @@ jobs:
         run: |
           DAY=$(TZ=Asia/Taipei date +%Y-%m-%d)
           F=$(ls -1 out/signals/elec_*.txt 2>/dev/null | sort | tail -1)
+          if [ -z "$F" ]; then
+            echo "::error::找不到 out/signals/elec_*.txt，訊號那步可能沒產出檔案"
+            exit 1
+          fi
           echo "date=$DAY" >> $GITHUB_OUTPUT
           echo "file=$F" >> $GITHUB_OUTPUT
-          N=$(grep -cE '^[0-9]{4} ' "$F" 2>/dev/null || echo 0)
-          echo "n=$N" >> $GITHUB_OUTPUT
+          # ⚠️ grep -c 找不到時「會印出 0，同時回傳 exit 1」。
+          #    寫成 $(grep -c ... || echo 0) 會得到兩行的 "0\n0"，
+          #    塞進 GITHUB_OUTPUT 就是 Invalid format '0'（2026-09-15 踩過）。
+          #    用 || true 讓 grep 自己印的那個 0 成為唯一輸出。
+          N=$(grep -cE '^[0-9]{4} ' "$F" 2>/dev/null || true)
+          N=$(printf '%s' "${N:-0}" | head -1 | tr -cd '0-9')
+          echo "n=${N:-0}" >> $GITHUB_OUTPUT
           {
             echo "ELEC_LARGE 三張卡　$(basename "$F" .txt | sed 's/elec_//')"
             echo ""
