@@ -45,10 +45,6 @@ jobs:
 
       - run: pip install pandas numpy pyarrow matplotlib tabulate
 
-      - name: 中文字型
-        if: steps.guard.outputs.already != 'true'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq fonts-noto-cjk
-
       - name: 今天跑過了沒
         # 同 daily_momentum：避免同一天被觸發兩次而寄兩封重複的卡片信。
         # 想在同一天跑第二份名單時，用 force=true 繞過。
@@ -62,13 +58,16 @@ jobs:
             echo "already=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: 產生看盤卡
+      - name: 中文字型
         if: steps.guard.outputs.already != 'true'
-        if: github.event.inputs.mode != 'frequency'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fonts-noto-cjk
+
+      - name: 產生看盤卡
+        if: ${{ (steps.guard.outputs.already != 'true') && (github.event.inputs.mode != 'frequency') }}
         run: |
           ARGS=""
-          [ -n "${{ github.event.inputs.date }}" ] && ARGS="--date ${{ github.event.inputs.date }}"
-          [ -n "${{ github.event.inputs.ids }}" ] && ARGS="$ARGS --ids ${{ github.event.inputs.ids }}"
+          if [ -n "${{ github.event.inputs.date }}" ]; then ARGS="--date ${{ github.event.inputs.date }}"; fi
+          if [ -n "${{ github.event.inputs.ids }}" ]; then ARGS="$ARGS --ids ${{ github.event.inputs.ids }}"; fi
           FS="${{ github.event.inputs.from_signals }}"
           UNI="${{ github.event.inputs.universe }}"
           # 優先序：ids > from_signals > universe（有明確填值） > 自動接當天原始訊號。
@@ -81,7 +80,7 @@ jobs:
             DAY=$(TZ=Asia/Taipei date +%Y-%m-%d)
             CAND=""
             for PAT in "out/signals/raw_${DAY}.txt" "out/signals/elec_${DAY}.txt"; do
-              [ -e "$PAT" ] && CAND="$CAND $PAT"
+              if [ -e "$PAT" ]; then CAND="$CAND $PAT"; fi
             done
             if [ -z "$CAND" ]; then
               # 當天的沒有就退回找最新的一份（假日或資料落後時）
@@ -95,14 +94,13 @@ jobs:
               echo "自動接上：$CAND"
             fi
           fi
-          [ -n "$FS" ] && ARGS="$ARGS --from-signals $FS"
+          if [ -n "$FS" ]; then ARGS="$ARGS --from-signals $FS"; fi
           ARGS="$ARGS --limit ${{ github.event.inputs.limit || 40 }}"
           python scripts/oldhand_cards.py \
             --universe "${UNI:-universe_defense.csv}" $ARGS
 
       - name: 命中頻率統計
-        if: steps.guard.outputs.already != 'true'
-        if: github.event.inputs.mode == 'frequency'
+        if: ${{ (steps.guard.outputs.already != 'true') && (github.event.inputs.mode == 'frequency') }}
         run: |
           python scripts/combo_frequency.py \
             --universe "${{ github.event.inputs.universe || 'universe_defense.csv' }}" \
@@ -110,8 +108,7 @@ jobs:
             --respect-thesis
 
       - name: 命中後結果統計
-        if: steps.guard.outputs.already != 'true'
-        if: github.event.inputs.mode == 'outcomes'
+        if: ${{ (steps.guard.outputs.already != 'true') && (github.event.inputs.mode == 'outcomes') }}
         run: |
           python scripts/combo_outcomes.py \
             --universe "${{ github.event.inputs.universe || 'universe_defense.csv' }}" \
@@ -135,8 +132,7 @@ jobs:
           fi
 
       - name: 寄出卡片
-        if: steps.guard.outputs.already != 'true'
-        if: steps.pack.outputs.day != ''
+        if: ${{ (steps.guard.outputs.already != 'true') && (steps.pack.outputs.day != '') }}
         continue-on-error: true
         uses: dawidd6/action-send-mail@v3
         with:

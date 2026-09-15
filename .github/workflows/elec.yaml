@@ -74,8 +74,8 @@ jobs:
         if: steps.guard.outputs.already != 'true'
         run: |
           ARGS=""
-          [ -n "${{ github.event.inputs.date }}" ] && ARGS="--date ${{ github.event.inputs.date }}"
-          [ "${{ github.event.inputs.no_revenue }}" = "true" ] && ARGS="$ARGS --no-revenue"
+          if [ -n "${{ github.event.inputs.date }}" ]; then ARGS="--date ${{ github.event.inputs.date }}"; fi
+          if [ "${{ github.event.inputs.no_revenue }}" = "true" ]; then ARGS="$ARGS --no-revenue"; fi
           python scripts/daily_elec_cards.py $ARGS | tee /tmp/elec.log
           grep -E '^ELEC 母體|^as-of|^明日買進' /tmp/elec.log \
             | while read -r L; do echo "::notice::$L"; done

@@ -58,14 +58,6 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: 安裝套件
-        if: steps.guard.outputs.already != 'true'
-        run: |
-          python -m pip install -U pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install pandas numpy pyarrow requests
-
-      # 走 workflow_run 進來時，daily_adj 剛更新完，不用再更新一次。
       - name: 今天跑過了沒
         # daily_adj 一天跑兩班（冪等雙班），下游都掛在 workflow_run 上，
         # 所以每天被觸發兩次、寄兩封一模一樣的信。這道閘門讓「當天第一次」
@@ -81,9 +73,16 @@ jobs:
             echo "already=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: 更新價格資料
+      - name: 安裝套件
         if: steps.guard.outputs.already != 'true'
-        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.update_data == 'true') }}
+        run: |
+          python -m pip install -U pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pandas numpy pyarrow requests
+
+      # 走 workflow_run 進來時，daily_adj 剛更新完，不用再更新一次。
+      - name: 更新價格資料
+        if: ${{ (steps.guard.outputs.already != 'true') && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.update_data == 'true')) }}
         env:
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
         run: |
