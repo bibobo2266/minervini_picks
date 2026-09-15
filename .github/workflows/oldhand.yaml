@@ -75,8 +75,25 @@ jobs:
           # universe 要排在自動接之前 —— 否則你填了 watchlist_cpo.csv 卻永遠被
           # raw 檔蓋掉，因為每天跑動能訊號，raw 檔一定存在。
           if [ -z "${{ github.event.inputs.ids }}" ] && [ -z "$FS" ] && [ -z "$UNI" ]; then
-            LATEST=$(ls -1 out/signals/raw_*.txt 2>/dev/null | sort | tail -1)
-            [ -n "$LATEST" ] && FS="$LATEST" && echo "自動接上 $LATEST"
+            # 自動接上當天的訊號檔。raw_*（simple momentum 原始清單）與
+            # elec_*（ELEC 三張卡）都吃 —— 合成一個暫存檔一起產卡，
+            # 因為老手卡片只描述狀態，不管訊號來自哪一套。
+            DAY=$(TZ=Asia/Taipei date +%Y-%m-%d)
+            CAND=""
+            for PAT in "out/signals/raw_${DAY}.txt" "out/signals/elec_${DAY}.txt"; do
+              [ -e "$PAT" ] && CAND="$CAND $PAT"
+            done
+            if [ -z "$CAND" ]; then
+              # 當天的沒有就退回找最新的一份（假日或資料落後時）
+              CAND=$(ls -1 out/signals/raw_*.txt out/signals/elec_*.txt 2>/dev/null \
+                     | sort | tail -1)
+            fi
+            if [ -n "$CAND" ]; then
+              mkdir -p /tmp/sig
+              cat $CAND > /tmp/sig/combined.txt
+              FS=/tmp/sig/combined.txt
+              echo "自動接上：$CAND"
+            fi
           fi
           [ -n "$FS" ] && ARGS="$ARGS --from-signals $FS"
           ARGS="$ARGS --limit ${{ github.event.inputs.limit || 40 }}"

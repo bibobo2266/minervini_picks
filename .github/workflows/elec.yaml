@@ -1,0 +1,131 @@
+# ELEC_LARGE 三張卡：每日訊號
+#
+# 規格來源 Final_ELEC LARGE FINDINGS.md 第十一節「每日執行規格」。
+# 定義來源 scripts/probe_vcp.py（未修改）—— 母體、市值分層、rv、月營收全部沿用，
+# 不自己重寫。自己重寫過一次，市值分層與 rv 的 min_periods 就跑掉了。
+#
+# 跟「每日動能訊號」分開寄，因為兩者性質不同：
+#   simple momentum 的 raw 清單是純觀察清單，沒有部位語意
+#   ELEC 三張卡有停損公式、出場日與 20 日去重，是可執行的訊號
+# 混在一起會搞混。
+#
+# 觸發串在 daily_adj 之後（跟 momentum / watchlist / daily_cards 一致）。
+# 內建 cron 只當備援，而且有當日閘門保護，前面跑成功它就不做事。
+
+name: ELEC 三張卡
+
+on:
+  workflow_run:
+    workflows: ["Daily update (adjusted)"]
+    types: [completed]
+  schedule:
+    - cron: '10 8 * * 1-5'      # 備援。08:10 UTC = 16:10 台北，錯開 momentum 的整點
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'as-of（YYYY-MM-DD，留空=資料最後一天）'
+        default: ''
+      no_revenue:
+        description: '跳過卡三（月營收未入庫時用）'
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
+      force:
+        description: '同一天要再跑一次就設 true'
+        default: 'false'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: elec-cards
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # daily_adj 失敗時不要接著跑，訊號會是舊資料算的
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+
+      # pandas 鎖 <3：3.0 的 to_datetime 不再自動推斷混合格式
+      - run: pip install "pandas<3" pyarrow numpy tabulate
+
+      - name: 今天跑過了沒
+        # daily_adj 一天跑兩班（冪等雙班），下游掛在 workflow_run 上會被觸發兩次。
+        # 這道閘門讓「當天第一次」才真的做事，避免重複寄信。
+        id: guard
+        run: |
+          MARK="out/signals/elec_$(TZ=Asia/Taipei date +%Y-%m-%d).txt"
+          if [ -e "$MARK" ] && [ "${{ github.event.inputs.force }}" != "true" ]; then
+            echo "already=true" >> $GITHUB_OUTPUT
+            echo "::notice::$MARK 已存在，今天跑過了，跳過"
+          else
+            echo "already=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 產生訊號
+        if: steps.guard.outputs.already != 'true'
+        run: |
+          ARGS=""
+          [ -n "${{ github.event.inputs.date }}" ] && ARGS="--date ${{ github.event.inputs.date }}"
+          [ "${{ github.event.inputs.no_revenue }}" = "true" ] && ARGS="$ARGS --no-revenue"
+          python scripts/daily_elec_cards.py $ARGS | tee /tmp/elec.log
+          grep -E '^ELEC 母體|^as-of|^明日買進' /tmp/elec.log \
+            | while read -r L; do echo "::notice::$L"; done
+
+      - name: 準備信件
+        if: steps.guard.outputs.already != 'true'
+        id: mail
+        run: |
+          DAY=$(TZ=Asia/Taipei date +%Y-%m-%d)
+          F=$(ls -1 out/signals/elec_*.txt 2>/dev/null | sort | tail -1)
+          echo "date=$DAY" >> $GITHUB_OUTPUT
+          echo "file=$F" >> $GITHUB_OUTPUT
+          N=$(grep -cE '^[0-9]{4} ' "$F" 2>/dev/null || echo 0)
+          echo "n=$N" >> $GITHUB_OUTPUT
+          {
+            echo "ELEC_LARGE 三張卡　$(basename "$F" .txt | sed 's/elec_//')"
+            echo ""
+            cat "$F"
+            echo ""
+            echo "---"
+            echo "卡二＝主卡（裸 250 日新高，n=3,150，10/10 年正超額）"
+            echo "卡一＝加碼（VCP 壓縮，n=259，11/11 年正超額，低頻高單筆）"
+            echo "卡三＝卡二的品質濾網（月營收 YoY>20%，與卡二重疊 45%）"
+            echo ""
+            echo "停損價要等 T+1 開盤成交後才能確定：開盤價 x 0.88，立即掛出。"
+            echo "部位比例本清單不指定。"
+          } > mail_body.txt
+
+      - name: 寄出
+        if: steps.guard.outputs.already != 'true'
+        continue-on-error: true
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.GMAIL_USER }}
+          password: ${{ secrets.GMAIL_APP_PASSWORD }}
+          from: ELEC Cards
+          to: ${{ secrets.MAIL_TO }}
+          subject: "[ELEC 三張卡] ${{ steps.mail.outputs.date }}　買進 ${{ steps.mail.outputs.n }} 檔"
+          body: file://mail_body.txt
+          attachments: ${{ steps.mail.outputs.file }}
+
+      - name: Commit
+        if: steps.guard.outputs.already != 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add out/signals || true
+          git diff --staged --quiet || git commit -m "elec signals $(TZ=Asia/Taipei date +%F)"
+          git pull --rebase || true
+          git push
