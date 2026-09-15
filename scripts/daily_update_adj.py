@@ -55,6 +55,10 @@ import requests
 
 TWSE = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 TPEX = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
+# 備援端點。2026-09-15 主端點連續三次 ChunkedEncodingError（Response ended
+# prematurely）—— 伺服器在 chunked 傳輸中途斷線，不是憑證也不是逾時。
+# 同一份資料在 mopsfin 也有一份 CSV，格式不同但欄位對得上。
+TPEX_ALT = "https://www.tpex.org.tw/www/zh-tw/afterTrading/otc?type=Daily&response=json"
 FINMIND = "https://api.finmindtrade.com/api/v4/data"
 
 DATA_DIR = "data/adj"
@@ -91,10 +95,12 @@ def roc_to_iso(s: str) -> str:
     return f"{int(s[:3]) + 1911:04d}-{s[3:5]}-{s[5:7]}"
 
 
+UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 SYS_CA = "/etc/ssl/certs/ca-certificates.crt"   # Ubuntu runner 的系統憑證庫
 
 
-def _get(url: str, timeout: int = 60, tries: int = 4, **kw):
+def _get(url: str, timeout: int = 60, tries: int = 6, **kw):
     """帶重試的 GET，並在憑證驗證失敗時逐級退讓。
 
     2026-09-02 的失敗：TPEx 那包 3.9MB 只收到 36 萬 bytes 就斷線
@@ -133,7 +139,14 @@ def _get(url: str, timeout: int = 60, tries: int = 4, **kw):
                     import urllib3
                     urllib3.disable_warnings(
                         urllib3.exceptions.InsecureRequestWarning)
-                r = requests.get(url, timeout=timeout, **{**kw, **extra})
+                hdr = dict(kw.pop("headers", {}) if "headers" in kw else {})
+                # identity：不要 gzip。截斷發生在 chunked 解碼階段，
+                # 拿掉壓縮層可以少一個會爆的地方。
+                hdr.setdefault("accept-encoding", "identity")
+                hdr.setdefault("connection", "close")
+                hdr.setdefault("user-agent", UA)
+                r = requests.get(url, timeout=timeout,
+                                 headers=hdr, **{**kw, **extra})
                 r.raise_for_status()
                 # 提早讀完整個 body，斷線在這裡就會爆，而不是留給後面的 .json()
                 _ = r.content
@@ -148,7 +161,10 @@ def _get(url: str, timeout: int = 60, tries: int = 4, **kw):
                     print(f"  憑證驗證失敗（{name}），改用下一種方式")
                     break                      # 憑證問題重試沒用，直接換模式
                 if i < tries - 1:
-                    wait = 3 * (2 ** i)
+                    # 退避上限 60s。原本 3/6/12 只撐 21 秒就放棄，
+                    # 但交易所的斷線窗口常常持續一兩分鐘（2026-09-15 實例）。
+                    # 改成 5/10/20/40/60/60，總共約 3 分鐘。
+                    wait = min(5 * (2 ** i), 60)
                     print(f"  第 {i + 1} 次抓取失敗（{type(e).__name__}），"
                           f"{wait}s 後重試")
                     time.sleep(wait)
@@ -175,9 +191,23 @@ def fetch_twse() -> pd.DataFrame:
 
 
 def fetch_tpex():
-    r = _get(TPEX, timeout=60, headers={"accept": "application/json"})
+    """主端點失敗時改用備援。兩邊欄位名不同，交給 pick() 逐一比對。"""
+    try:
+        r = _get(TPEX, timeout=90, headers={"accept": "application/json"})
+    except Exception as e:                                       # noqa: BLE001
+        print(f"  ⚠ TPEx 主端點失敗（{type(e).__name__}），改試備援端點")
+        r = _get(TPEX_ALT, timeout=90, headers={"accept": "application/json"})
+        print("  ⚠ 用備援端點才連得上 TPEx")
     r.raise_for_status()
-    df = pd.DataFrame(r.json())
+    js = r.json()
+    if isinstance(js, dict):          # 備援端點包在 tables/data 裡
+        for k in ("aaData", "data", "tables"):
+            if k in js:
+                js = js[k]
+                break
+        if isinstance(js, list) and js and isinstance(js[0], dict) and "data" in js[0]:
+            js = js[0]["data"]
+    df = pd.DataFrame(js)
     if df.empty:
         return df, None
     date = None
