@@ -128,7 +128,10 @@ jobs:
           if [ -n "$DAY" ]; then
             zip -qr "cards_${SRC}_$DAY.zip" "cards/$DAY"
             # 總表轉成純文字放進信件內文，手機上不用開附件就看得到
-            sed -n '1,60p' "cards/$DAY/index.md" > mail_body.txt
+            # 讀自己這份名單的總表，不是當日目錄
+            IDX="cards/$DAY/index_${SRC}.md"
+            [ -e "$IDX" ] || IDX="cards/$DAY/index.md"
+            sed -n '1,60p' "$IDX" > mail_body.txt
             echo "" >> mail_body.txt
             echo "完整卡片（每檔 .md + 標註圖）在附件 zip，或 repo 的 cards/$DAY/" >> mail_body.txt
           fi
